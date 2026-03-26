@@ -10,9 +10,6 @@ import (
 	"github.com/lwdjd/IPFAR/lang"
 )
 
-// ConfigFile 全局配置文件实例
-var ConfigFile *Config
-
 //go:embed defaults
 var defaultsFS embed.FS
 
