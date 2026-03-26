@@ -23,7 +23,7 @@ func main() {
 
 	name := flag.String("name", "NULL", Loc.Get("name of the IPFAR"))
 	flag.Parse()
-	// fmt.Println(config.ConfigFile.Language)
+
 	fmt.Println(Loc.Get("Hello, World!"))
 	fmt.Println(Loc.Get("My name is %s.", *name))
 }
