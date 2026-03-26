@@ -1,0 +1,12 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "Hello, World!"
+msgstr "你好，世界！"
+
+msgid "My name is %s."
+msgstr "我的名字是%s。"
+
+msgid "name of the IPFAR"
+msgstr "IPFAR的昵称"

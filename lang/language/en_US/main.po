@@ -1,0 +1,12 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "Hello, World!"
+msgstr "Hello, World!"
+
+msgid "My name is %s."
+msgstr "My name is %s."
+
+msgid "name of the IPFAR"
+msgstr "name of the IPFAR"

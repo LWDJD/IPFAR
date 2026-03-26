@@ -1,0 +1,8 @@
+配置文件管理: https://github.com/knadh/koanf
+KV数据库: https://github.com/dgraph-io/badger
+多语言支持: https://github.com/leonelquinteros/gotext
+多系统语言获取POSIX格式: https://github.com/Xuanwo/go-locale
+CAR文件解析: https://github.com/ipld/go-car
+BitSwap支持: https://github.com/ipfs/boxo
+点对点支持: https://github.com/libp2p/go-libp2p
+内容发布及寻址支持: https://github.com/libp2p/go-libp2p-kad-dht
