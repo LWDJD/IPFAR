@@ -4,6 +4,3 @@ package config
 type Config struct {
 	Language string `json:"language"`
 }
-
-// ConfigFile 全局配置文件实例
-var ConfigFile *Config
