@@ -84,7 +84,7 @@ func Load(path string, modifiers ...ConfigModifier) (*Config, error) {
 	return &cfg, nil
 }
 
-// GetConfig 获取配置
+// GetConfig 获取全局配置实例
 func GetConfig() (*Config, error) {
 	// 只需要传入一个路径
 	// 自动从 config/defaults/config.json 读取默认值

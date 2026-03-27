@@ -13,10 +13,12 @@ var Loc *gotext.Locale
 
 func init() {
 	err := error(nil)
+	// 加载配置文件
 	config.ConfigFile, err = config.GetConfig()
 	if err != nil {
 		panic(err)
 	}
+	// 初始化语言
 	Loc = lang.GetLocale(config.ConfigFile.Language)
 }
 func main() {
