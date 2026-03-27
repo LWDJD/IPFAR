@@ -4,12 +4,9 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/leonelquinteros/gotext"
 	"github.com/lwdjd/IPFAR/config"
 	"github.com/lwdjd/IPFAR/lang"
 )
-
-var Loc *gotext.Locale
 
 func init() {
 	err := error(nil)
@@ -19,13 +16,13 @@ func init() {
 		panic(err)
 	}
 	// 初始化语言
-	Loc = lang.GetLocale(config.ConfigFile.Language)
+	config.Loc = lang.GetLocale(config.ConfigFile.Language)
 }
 func main() {
 
-	name := flag.String("name", "NULL", Loc.Get("name of the IPFAR"))
+	name := flag.String("name", "NULL", config.Loc.Get("name of the IPFAR"))
 	flag.Parse()
 
-	fmt.Println(Loc.Get("Hello, World!"))
-	fmt.Println(Loc.Get("My name is %s.", *name))
+	fmt.Println(config.Loc.Get("Hello, World!"))
+	fmt.Println(config.Loc.Get("My name is %s.", *name))
 }
