@@ -6,3 +6,13 @@ CAR文件解析: https://github.com/ipld/go-car
 BitSwap支持: https://github.com/ipfs/boxo
 点对点支持: https://github.com/libp2p/go-libp2p
 内容发布及寻址支持: https://github.com/libp2p/go-libp2p-kad-dht
+
+
+1.Arweave上的文件采用：CID元数据(带Tags标签)->CAR文件，元数据中包含可选的DAG引用项目。
+2.Bitswap使用延迟回复机制降低自己被使用的优先级，减少arweave回源次数。
+3.主CAR文件大于100MB的文件只需要对CAR文件做根校验，以及CARv2中的索引存在校验。
+4.主CAR文件小于100MB的文件需要在轻量校验之前做POW验证，之后再做轻量验证。
+5.开发全量验证功能，这适合重量级桥。
+6.开发本地文件缓存功能，这时候所有桥，可自定义缓存大小。
+7.开发链上增量数据库，仅桥节点运营者自己使用，可以把已经验证过的数据写入桥上，未来可以直接调用此数据，无需二次验证。
+8.可自定义网关接口，以便用户可以根据需要使用公共网关、本地网关、可验证网关路由等方式，最终安全性由IPFS兜底。
