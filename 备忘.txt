@@ -6,9 +6,10 @@ CAR文件解析: https://github.com/ipld/go-car
 BitSwap支持: https://github.com/ipfs/boxo
 点对点支持: https://github.com/libp2p/go-libp2p
 内容发布及寻址支持: https://github.com/libp2p/go-libp2p-kad-dht
+Arweave ANS-104	捆绑包阅读与验证: https://github.com/ar-io/arbundles
 
 
-1.Arweave上的文件采用：CID元数据(带Tags标签)->CAR文件，元数据中包含可选的DAG引用项目。
+1.Arweave上的文件采用：CID元数据(带Tags标签)->CAR文件(V2)，元数据中包含可选的DAG引用项目(目的是可选的去重)。
 2.Bitswap使用延迟回复机制降低自己被使用的优先级，减少arweave回源次数。
 3.主CAR文件大于100MB的文件只需要对CAR文件做根校验，以及CARv2中的索引存在校验。
 4.主CAR文件小于100MB的文件需要在轻量校验之前做POW验证，之后再做轻量验证。
@@ -16,3 +17,6 @@ BitSwap支持: https://github.com/ipfs/boxo
 6.开发本地文件缓存功能，这时候所有桥，可自定义缓存大小。
 7.开发链上增量数据库，仅桥节点运营者自己使用，可以把已经验证过的数据写入桥上，未来可以直接调用此数据，无需二次验证。
 8.可自定义网关接口，以便用户可以根据需要使用公共网关、本地网关、可验证网关路由等方式，最终安全性由IPFS兜底。
+9.从矿工获取原始数据，而是直接询问矿工，在块中搜索，采用去重随机游走的方式寻找数据，同时保证订阅或轮询最新的块。
+10.去重方法采用 无状态密码学排列（Feistel 网络 / 格式保留加密）。
+11.使用带导航的随机游走，使用bitlist存储块高是否存在IPFS数据即可，每一位表示一个块高度，0表示无，1表示有，采用某种不可信的分发方式，由于bitlist极小，所以可以轻易存储几十上百个不可信导航。
