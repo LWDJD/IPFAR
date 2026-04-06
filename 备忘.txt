@@ -6,7 +6,7 @@ CAR文件解析: https://github.com/ipld/go-car
 BitSwap支持: https://github.com/ipfs/boxo
 点对点支持: https://github.com/libp2p/go-libp2p
 内容发布及寻址支持: https://github.com/libp2p/go-libp2p-kad-dht
-Arweave ANS-104	捆绑包阅读与验证: https://github.com/ar-io/arbundles
+Arweave ANS-104	捆绑包阅读与验证: https://github.com/ar-io/arbundles  或  https://github.com/permadao/goar
 
 
 1.Arweave上的文件采用：CID元数据(带Tags标签)->CAR文件(V2)，元数据中包含可选的DAG引用项目(目的是可选的去重)。
