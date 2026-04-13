@@ -21,3 +21,8 @@ Arweave ANS-104	捆绑包阅读与验证: https://github.com/ar-io/arbundles  �
 10.去重方法采用 无状态密码学排列（Feistel 网络 / 格式保留加密）。
 11.使用带导航的随机游走，使用bitlist存储块高是否存在IPFS数据即可，每一位表示一个块高度，0表示无，1表示有，采用某种不可信的分发方式，由于bitlist极小，所以可以轻易存储几十上百个不可信导航。
 12.需要同时原生数据和Bundle捆绑包中的数据。
+
+
+相关内容：
+1.zkIFPS：https://zkipfs.vercel.app/  https://x.com/weave_db/status/1970853988045320204  https://www.arweaveoasis.com/new/279c18e6-90da-801a-b0ec-d37f6d23c48f
+2.arweave-ipfs-bridge：https://github.com/AndreiD/arweave-ipfs-bridge
