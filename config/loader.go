@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/lwdjd/IPFAR/internal/log"
 	"github.com/lwdjd/IPFAR/lang"
 )
 
@@ -36,13 +37,17 @@ func Load(path string, modifiers ...ConfigModifier) (*Config, error) {
 		// 从二进制嵌入中读取
 		data, err := defaultsFS.ReadFile(embedPath)
 		if err != nil {
+			log.Error("读取嵌入配置失败：%s, 错误：%v", embedPath, err)
 			return nil, fmt.Errorf("read embedded config '%s' failed: %w", embedPath, err)
 		}
+		log.Debug("成功读取嵌入配置：%s", embedPath)
 
 		// 解析到内存对象
 		if err := json.Unmarshal(data, &cfg); err != nil {
+			log.Error("解析嵌入配置失败：%s, 错误：%v", embedPath, err)
 			return nil, fmt.Errorf("parse embedded config failed: %w", err)
 		}
+		log.Debug("成功解析嵌入配置：%s", embedPath)
 
 		// 依次调用修改器
 		for _, modifier := range modifiers {
@@ -54,31 +59,37 @@ func Load(path string, modifiers ...ConfigModifier) (*Config, error) {
 		// 序列化回 JSON
 		newData, err := json.MarshalIndent(cfg, "", "  ")
 		if err != nil {
+			log.Error("序列化配置失败：%v", err)
 			return nil, fmt.Errorf("marshal modified config failed: %w", err)
 		}
 
 		// 创建目录
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			log.Error("创建配置目录失败：%s, 错误：%v", filepath.Dir(path), err)
 			return nil, fmt.Errorf("create config dir failed: %w", err)
 		}
 
 		// 写入磁盘
 		if err := os.WriteFile(path, newData, 0644); err != nil {
+			log.Error("写入配置文件失败：%s, 错误：%v", path, err)
 			return nil, fmt.Errorf("write default config to disk failed: %w", err)
 		}
 
-		fmt.Printf("[Config] Default config released to: %s\n", path)
+		log.Info("默认配置文件已释放到：%s", path)
 
 	} else {
-		// fmt.Println("testB")
 		// --- 文件存在，直接读取 ---
 		data, err := os.ReadFile(path)
 		if err != nil {
+			log.Error("读取磁盘配置文件失败：%s, 错误：%v", path, err)
 			return nil, fmt.Errorf("read disk config failed: %w", err)
 		}
+		log.Debug("从磁盘读取配置文件：%s", path)
 		if err := json.Unmarshal(data, &cfg); err != nil {
+			log.Error("解析磁盘配置文件失败：%s, 错误：%v", path, err)
 			return nil, fmt.Errorf("parse disk config failed: %w", err)
 		}
+		log.Info("配置文件加载成功：%s", path)
 	}
 
 	return &cfg, nil
@@ -86,16 +97,20 @@ func Load(path string, modifiers ...ConfigModifier) (*Config, error) {
 
 // GetConfig 获取全局配置实例
 func GetConfig() (*Config, error) {
+	log.Info("开始加载全局配置...")
 	// 只需要传入一个路径
 	// 自动从 config/defaults/config.json 读取默认值
 	cfg, err := Load("config.json", func(c *Config) {
 		// 修改器：设置系统语言
 		c.Language = lang.GetSystemLanguage()
+		log.Debug("检测到系统语言：%s", c.Language)
 	})
 
 	if err != nil {
+		log.Error("获取全局配置失败：%v", err)
 		return nil, err
 	}
 
+	log.Info("全局配置加载完成")
 	return cfg, nil
 }

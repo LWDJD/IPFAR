@@ -1,3 +1,7 @@
 {
-  "language": "en_US"
+  "language": "en_US",
+  "log_level": "info",
+  "log_file": "logs/ipfar.log",
+  "log_to_console": false,
+  "log_format": "text"
 }
