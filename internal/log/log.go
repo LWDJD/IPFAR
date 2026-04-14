@@ -38,6 +38,7 @@ type Logger struct {
 	file        *os.File
 	writer      *bufio.Writer
 	useFile     bool
+	useConsole  bool // 是否输出到控制台
 	useJSON     bool
 	encoding    string // "utf-8" or "gbk"
 	closeChan   chan struct{}
@@ -51,6 +52,7 @@ var globalLogger *Logger
 type Config struct {
 	Level         Level         // 日志级别
 	FilePath      string        // 日志文件路径（可选）
+	UseConsole    bool          // 是否输出到控制台
 	UseJSON       bool          // 是否使用 JSON 格式
 	Encoding      string        // 编码：utf-8, gbk
 	FlushInterval time.Duration // 刷盘间隔
@@ -64,12 +66,13 @@ func Init(cfg Config) error {
 	}
 
 	globalLogger = &Logger{
-		level:     cfg.Level,
-		prefix:    "",
-		filePath:  cfg.FilePath,
-		useJSON:   cfg.UseJSON,
-		encoding:  cfg.Encoding,
-		closeChan: make(chan struct{}),
+		level:      cfg.Level,
+		prefix:     "",
+		filePath:   cfg.FilePath,
+		useConsole: cfg.UseConsole,
+		useJSON:    cfg.UseJSON,
+		encoding:   cfg.Encoding,
+		closeChan:  make(chan struct{}),
 	}
 
 	if cfg.FlushInterval == 0 {
@@ -243,11 +246,13 @@ func (l *Logger) output(level Level, format string, args ...interface{}) {
 		}
 	}
 
-	// 输出到终端（ERROR 和 FATAL 到 stderr）
-	if level >= ERROR {
-		fmt.Fprintln(os.Stderr, line)
-	} else {
-		fmt.Println(line)
+	// 输出到终端（如果启用了控制台输出）
+	if l.useConsole {
+		if level >= ERROR {
+			fmt.Fprintln(os.Stderr, line)
+		} else {
+			fmt.Println(line)
+		}
 	}
 
 	// FATAL 级别退出

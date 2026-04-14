@@ -24,9 +24,10 @@ var Loc *gotext.Locale
 func InitLog() error {
 	if ConfigFile == nil {
 		return log.Init(log.Config{
-			Level:    log.INFO,
-			FilePath: "",
-			UseJSON:  false,
+			Level:      log.INFO,
+			FilePath:   "",
+			UseConsole: true,
+			UseJSON:    false,
 		})
 	}
 
@@ -48,9 +49,10 @@ func InitLog() error {
 
 	// 初始化日志
 	cfg := log.Config{
-		Level:    level,
-		FilePath: ConfigFile.LogFile,
-		UseJSON:  useJSON,
+		Level:      level,
+		FilePath:   ConfigFile.LogFile,
+		UseConsole: ConfigFile.LogToConsole,
+		UseJSON:    useJSON,
 	}
 
 	if err := log.Init(cfg); err != nil {
@@ -63,6 +65,7 @@ func InitLog() error {
 	if ConfigFile.LogFile != "" {
 		log.Info("日志文件路径：%s", ConfigFile.LogFile)
 	}
+	log.Info("控制台输出：%v", ConfigFile.LogToConsole)
 
 	return nil
 }
