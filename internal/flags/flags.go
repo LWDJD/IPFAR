@@ -124,6 +124,10 @@ func (fs *FlagSet) Parse() error {
 			fs.ShowHelp()
 			return nil
 		}
+		if arg == "--version" || arg == "-version" {
+			// version 参数特殊处理，让 flag 包解析
+			break
+		}
 	}
 
 	// 解析参数
@@ -167,6 +171,13 @@ func (fs *FlagSet) GetString(name string) string {
 
 // GetBool 获取布尔参数值
 func (fs *FlagSet) GetBool(name string) bool {
+	// 首先尝试从 flag.FlagSet 获取
+	f := fs.flagSet.Lookup(name)
+	if f != nil {
+		return f.Value.String() == "true"
+	}
+
+	// 回退到旧方法
 	value := fs.Get(name)
 	return value == "true" || value == "1" || value == "yes"
 }
