@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -56,6 +58,7 @@ type Config struct {
 	UseJSON       bool          // 是否使用 JSON 格式
 	Encoding      string        // 编码：utf-8, gbk
 	FlushInterval time.Duration // 刷盘间隔
+	MaxFiles      int           // 最大保留日志文件数（默认 5）
 }
 
 // Init 初始化全局日志
@@ -79,12 +82,19 @@ func Init(cfg Config) error {
 		cfg.FlushInterval = 5 * time.Second
 	}
 
+	if cfg.MaxFiles <= 0 {
+		cfg.MaxFiles = 5
+	}
+
 	// 如果指定了文件路径，打开文件
 	if cfg.FilePath != "" {
 		if err := globalLogger.openFile(); err != nil {
 			return fmt.Errorf("打开日志文件失败：%w", err)
 		}
 		globalLogger.useFile = true
+
+		// 清理旧日志文件
+		globalLogger.cleanupOldLogs(cfg.MaxFiles)
 
 		// 启动定时刷盘
 		globalLogger.flushTicker = time.NewTicker(cfg.FlushInterval)
@@ -96,27 +106,108 @@ func Init(cfg Config) error {
 
 // openFile 打开日志文件
 func (l *Logger) openFile() error {
+	// 生成带日期时间和序号的日志文件名
+	filePath := l.generateLogFilePath()
+	l.filePath = filePath
+
 	// 创建目录
-	dir := filepath.Dir(l.filePath)
+	dir := filepath.Dir(filePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
-	// 打开文件（追加模式）
-	f, err := os.OpenFile(l.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// 打开文件（写入模式，每次启动新建）
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
 
-	// 如果是新文件，写入 UTF-8 BOM
-	stat, _ := f.Stat()
-	if stat.Size() == 0 {
-		f.Write([]byte{0xEF, 0xBB, 0xBF}) // UTF-8 BOM
-	}
+	// 写入 UTF-8 BOM
+	f.Write([]byte{0xEF, 0xBB, 0xBF}) // UTF-8 BOM
 
 	l.file = f
 	l.writer = bufio.NewWriter(f)
 	return nil
+}
+
+// generateLogFilePath 生成带日期时间和序号的日志文件路径
+func (l *Logger) generateLogFilePath() string {
+	now := time.Now()
+	dateStr := now.Format("2006-01-02_15-04-05")
+
+	dir := filepath.Dir(l.filePath)
+	baseName := filepath.Base(l.filePath)
+	ext := filepath.Ext(baseName)
+	nameWithoutExt := strings.TrimSuffix(baseName, ext)
+
+	// 查找可用序号
+	seq := 1
+	for {
+		fileName := fmt.Sprintf("%s_%s_%d%s", nameWithoutExt, dateStr, seq, ext)
+		filePath := filepath.Join(dir, fileName)
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			return filePath
+		}
+		seq++
+		if seq > 1000 {
+			// 防止无限循环
+			return filePath
+		}
+	}
+}
+
+// cleanupOldLogs 清理旧日志文件，只保留最近 N 个
+func (l *Logger) cleanupOldLogs(maxFiles int) {
+	dir := filepath.Dir(l.filePath)
+	baseName := filepath.Base(l.filePath)
+	ext := filepath.Ext(baseName)
+	nameWithoutExt := strings.TrimSuffix(baseName, ext)
+
+	// 读取目录中的所有日志文件
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	// 收集匹配的日志文件
+	type logFile struct {
+		path    string
+		modTime time.Time
+	}
+	var logFiles []logFile
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		// 匹配格式：nameWithoutExt_YYYY-MM-DD_HH-MM-SS_N.ext
+		if strings.HasPrefix(name, nameWithoutExt+"_") && strings.HasSuffix(name, ext) {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			logFiles = append(logFiles, logFile{
+				path:    filepath.Join(dir, name),
+				modTime: info.ModTime(),
+			})
+		}
+	}
+
+	// 如果文件数不超过限制，不需要清理
+	if len(logFiles) <= maxFiles {
+		return
+	}
+
+	// 按修改时间排序（从新到旧）
+	sort.Slice(logFiles, func(i, j int) bool {
+		return logFiles[i].modTime.After(logFiles[j].modTime)
+	})
+
+	// 删除超出限制的最旧文件
+	for i := maxFiles; i < len(logFiles); i++ {
+		os.Remove(logFiles[i].path)
+	}
 }
 
 // flushLoop 定时刷盘循环
