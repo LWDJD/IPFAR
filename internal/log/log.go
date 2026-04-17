@@ -88,13 +88,16 @@ func Init(cfg Config) error {
 
 	// 如果指定了文件路径，打开文件
 	if cfg.FilePath != "" {
+		// 保存原始文件路径用于清理匹配
+		originalBaseName := filepath.Base(cfg.FilePath)
+
 		if err := globalLogger.openFile(); err != nil {
 			return fmt.Errorf("打开日志文件失败：%w", err)
 		}
 		globalLogger.useFile = true
 
 		// 清理旧日志文件
-		globalLogger.cleanupOldLogs(cfg.MaxFiles)
+		globalLogger.cleanupOldLogs(cfg.MaxFiles, originalBaseName)
 
 		// 启动定时刷盘
 		globalLogger.flushTicker = time.NewTicker(cfg.FlushInterval)
@@ -157,11 +160,10 @@ func (l *Logger) generateLogFilePath() string {
 }
 
 // cleanupOldLogs 清理旧日志文件，只保留最近 N 个
-func (l *Logger) cleanupOldLogs(maxFiles int) {
+func (l *Logger) cleanupOldLogs(maxFiles int, originalBaseName string) {
 	dir := filepath.Dir(l.filePath)
-	baseName := filepath.Base(l.filePath)
-	ext := filepath.Ext(baseName)
-	nameWithoutExt := strings.TrimSuffix(baseName, ext)
+	ext := filepath.Ext(originalBaseName)
+	nameWithoutExt := strings.TrimSuffix(originalBaseName, ext)
 
 	// 读取目录中的所有日志文件
 	entries, err := os.ReadDir(dir)
@@ -256,11 +258,20 @@ func Close() error {
 	}
 
 	// 关闭文件
+	var err error
 	if globalLogger.file != nil {
-		return globalLogger.file.Close()
+		err = globalLogger.file.Close()
 	}
 
-	return nil
+	// 重置状态，防止 Close 后调用日志函数导致 panic
+	globalLogger.useFile = false
+	globalLogger.useConsole = false
+	globalLogger.file = nil
+	globalLogger.writer = nil
+	globalLogger.flushTicker = nil
+	globalLogger = nil
+
+	return err
 }
 
 // String 日志级别转字符串
@@ -297,6 +308,10 @@ func SetPrefix(prefix string) {
 
 // output 输出日志
 func (l *Logger) output(level Level, format string, args ...interface{}) {
+	if l == nil {
+		return
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -375,13 +390,6 @@ func Error(format string, args ...interface{}) {
 // Fatal 输出 FATAL 级别日志并退出
 func Fatal(format string, args ...interface{}) {
 	globalLogger.output(FATAL, format, args...)
-}
-
-// WithPrefix 创建带前缀的日志
-func WithPrefix(prefix string) {
-	globalLogger.mu.Lock()
-	defer globalLogger.mu.Unlock()
-	globalLogger.prefix = prefix
 }
 
 // ResetPrefix 重置日志前缀

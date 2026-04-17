@@ -1,14 +1,15 @@
 package log
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestLoggerBasic(t *testing.T) {
-	// 初始化日志
 	cfg := Config{
 		Level:    DEBUG,
 		FilePath: "",
@@ -19,7 +20,6 @@ func TestLoggerBasic(t *testing.T) {
 	}
 	defer Close()
 
-	// 测试各个级别的日志输出
 	Debug("这是一条 DEBUG 日志")
 	Info("这是一条 INFO 日志")
 	Warn("这是一条 WARN 日志")
@@ -36,7 +36,6 @@ func TestLoggerLevel(t *testing.T) {
 	}
 	defer Close()
 
-	// 测试日志级别设置
 	SetLevel(DEBUG)
 	Debug("DEBUG 级别应该显示")
 
@@ -53,7 +52,6 @@ func TestLoggerLevel(t *testing.T) {
 	Warn("ERROR 级别不应该显示这条 WARN")
 	Error("ERROR 级别应该显示")
 
-	// 恢复默认级别
 	SetLevel(INFO)
 }
 
@@ -83,19 +81,17 @@ func TestLoggerFormat(t *testing.T) {
 	}
 	defer Close()
 
-	// 测试格式化输出
 	name := "测试"
 	count := 42
 	Info("用户：%s, 数量：%d", name, count)
 }
 
 func TestLoggerFile(t *testing.T) {
-	// 创建临时目录
-	tmpDir := filepath.Join(os.TempDir(), "log_test")
+	tmpDir := filepath.Join(os.TempDir(), "ipfar_log_test")
 	logFile := filepath.Join(tmpDir, "test.log")
 
-	// 清理旧文件
 	os.RemoveAll(tmpDir)
+	defer os.RemoveAll(tmpDir)
 
 	cfg := Config{
 		Level:         INFO,
@@ -110,27 +106,34 @@ func TestLoggerFile(t *testing.T) {
 	Info("测试文件日志")
 	Error("测试错误日志")
 
-	// 等待刷盘
 	time.Sleep(2 * time.Second)
 
 	Close()
 
-	// 检查文件是否存在
-	if _, err := os.Stat(logFile); os.IsNotExist(err) {
-		t.Fatalf("日志文件未创建：%s", logFile)
-	}
-
-	// 读取文件内容
-	content, err := os.ReadFile(logFile)
+	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
-		t.Fatalf("读取日志文件失败：%v", err)
+		t.Fatalf("读取日志目录失败：%v", err)
 	}
 
-	if len(content) == 0 {
-		t.Fatal("日志文件为空")
+	found := false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "test_") && strings.HasSuffix(entry.Name(), ".log") {
+			found = true
+			content, err := os.ReadFile(filepath.Join(tmpDir, entry.Name()))
+			if err != nil {
+				t.Fatalf("读取日志文件失败：%v", err)
+			}
+			if len(content) == 0 {
+				t.Fatal("日志文件为空")
+			}
+			t.Logf("日志文件内容：%s", string(content))
+			break
+		}
 	}
 
-	t.Logf("日志文件内容：%s", string(content))
+	if !found {
+		t.Fatal("未找到带日期时间命名的日志文件")
+	}
 }
 
 func TestLoggerJSON(t *testing.T) {
@@ -148,7 +151,6 @@ func TestLoggerJSON(t *testing.T) {
 }
 
 func TestLoggerReinit(t *testing.T) {
-	// 第一次初始化
 	cfg1 := Config{
 		Level:    INFO,
 		FilePath: "",
@@ -158,7 +160,6 @@ func TestLoggerReinit(t *testing.T) {
 	}
 	Info("第一次初始化")
 
-	// 第二次初始化（应该关闭第一次的）
 	cfg2 := Config{
 		Level:    DEBUG,
 		FilePath: "",
@@ -168,4 +169,186 @@ func TestLoggerReinit(t *testing.T) {
 	}
 	defer Close()
 	Debug("第二次初始化")
+}
+
+func TestCloseSafety(t *testing.T) {
+	cfg := Config{
+		Level:    INFO,
+		FilePath: "",
+	}
+	if err := Init(cfg); err != nil {
+		t.Fatalf("初始化日志失败：%v", err)
+	}
+
+	Info("关闭前日志")
+
+	Close()
+
+	Info("关闭后日志 - 不应 panic")
+	Debug("关闭后日志 - 不应 panic")
+	Warn("关闭后日志 - 不应 panic")
+	Error("关闭后日志 - 不应 panic")
+}
+
+func TestCloseNil(t *testing.T) {
+	globalLogger = nil
+
+	err := Close()
+	if err != nil {
+		t.Errorf("Close nil logger 不应返回错误：%v", err)
+	}
+}
+
+func TestDoubleClose(t *testing.T) {
+	cfg := Config{
+		Level:    INFO,
+		FilePath: "",
+	}
+	if err := Init(cfg); err != nil {
+		t.Fatalf("初始化日志失败：%v", err)
+	}
+
+	Info("测试双重关闭")
+
+	Close()
+	Close()
+}
+
+func TestUseConsole(t *testing.T) {
+	cfg := Config{
+		Level:      INFO,
+		FilePath:   "",
+		UseConsole: true,
+	}
+	if err := Init(cfg); err != nil {
+		t.Fatalf("初始化日志失败：%v", err)
+	}
+	defer Close()
+
+	Info("控制台输出测试")
+}
+
+func TestUseConsoleDisabled(t *testing.T) {
+	cfg := Config{
+		Level:      INFO,
+		FilePath:   "",
+		UseConsole: false,
+	}
+	if err := Init(cfg); err != nil {
+		t.Fatalf("初始化日志失败：%v", err)
+	}
+	defer Close()
+
+	Info("不应输出到控制台")
+}
+
+func TestMaxFiles(t *testing.T) {
+	tmpDir := filepath.Join(os.TempDir(), "ipfar_maxfiles_test")
+	logFile := filepath.Join(tmpDir, "app.log")
+
+	os.RemoveAll(tmpDir)
+	defer os.RemoveAll(tmpDir)
+
+	os.MkdirAll(tmpDir, 0755)
+
+	for i := 0; i < 7; i++ {
+		f, err := os.Create(filepath.Join(tmpDir, fmt.Sprintf("app_2026-01-%02d_12-00-00_%d.log", i+1, i+1)))
+		if err != nil {
+			t.Fatalf("创建测试文件失败：%v", err)
+		}
+		f.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	entriesBefore, _ := os.ReadDir(tmpDir)
+	if len(entriesBefore) != 7 {
+		t.Fatalf("预创建文件数量不对：期望 7，得到 %d", len(entriesBefore))
+	}
+
+	cfg := Config{
+		Level:         INFO,
+		FilePath:      logFile,
+		MaxFiles:      3,
+		FlushInterval: 1 * time.Second,
+	}
+	if err := Init(cfg); err != nil {
+		t.Fatalf("初始化日志失败：%v", err)
+	}
+
+	Info("测试 MaxFiles")
+
+	Close()
+
+	entriesAfter, _ := os.ReadDir(tmpDir)
+	if len(entriesAfter) > 4 {
+		t.Errorf("清理后文件数量不对：期望最多 4（3 旧 + 1 新），得到 %d", len(entriesAfter))
+	}
+}
+
+func TestSetFile(t *testing.T) {
+	tmpDir := filepath.Join(os.TempDir(), "ipfar_setfile_test")
+
+	os.RemoveAll(tmpDir)
+	defer os.RemoveAll(tmpDir)
+
+	cfg := Config{
+		Level:    INFO,
+		FilePath: "",
+	}
+	if err := Init(cfg); err != nil {
+		t.Fatalf("初始化日志失败：%v", err)
+	}
+	defer Close()
+
+	newFile := filepath.Join(tmpDir, "dynamic.log")
+	if err := SetFile(newFile); err != nil {
+		t.Fatalf("SetFile 失败：%v", err)
+	}
+
+	Info("动态设置文件后的日志")
+}
+
+func TestDisableFile(t *testing.T) {
+	tmpDir := filepath.Join(os.TempDir(), "ipfar_disablefile_test")
+	logFile := filepath.Join(tmpDir, "test.log")
+
+	os.RemoveAll(tmpDir)
+	defer os.RemoveAll(tmpDir)
+
+	cfg := Config{
+		Level:         INFO,
+		FilePath:      logFile,
+		FlushInterval: 1 * time.Second,
+	}
+	if err := Init(cfg); err != nil {
+		t.Fatalf("初始化日志失败：%v", err)
+	}
+	defer Close()
+
+	Info("文件启用时的日志")
+
+	DisableFile()
+
+	Info("文件禁用后的日志")
+}
+
+func TestLevelString(t *testing.T) {
+	tests := []struct {
+		level    Level
+		expected string
+	}{
+		{DEBUG, "DEBUG"},
+		{INFO, "INFO"},
+		{WARN, "WARN"},
+		{ERROR, "ERROR"},
+		{FATAL, "FATAL"},
+		{Level(99), "UNKNOWN"},
+	}
+
+	for _, tt := range tests {
+		result := tt.level.String()
+		if result != tt.expected {
+			t.Errorf("Level(%d).String() = %s, 期望 %s", tt.level, result, tt.expected)
+		}
+	}
 }

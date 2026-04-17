@@ -26,7 +26,7 @@ func InitLog() error {
 		return log.Init(log.Config{
 			Level:      log.INFO,
 			FilePath:   "",
-			UseConsole: true,
+			UseConsole: false,
 			UseJSON:    false,
 		})
 	}
