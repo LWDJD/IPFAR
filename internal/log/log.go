@@ -40,11 +40,12 @@ type Logger struct {
 	file        *os.File
 	writer      *bufio.Writer
 	useFile     bool
-	useConsole  bool // 是否输出到控制台
+	useConsole  bool
 	useJSON     bool
-	encoding    string // "utf-8" or "gbk"
+	encoding    string
 	closeChan   chan struct{}
 	flushTicker *time.Ticker
+	wg          sync.WaitGroup
 }
 
 // 全局日志实例
@@ -88,16 +89,20 @@ func Init(cfg Config) error {
 
 	// 如果指定了文件路径，打开文件
 	if cfg.FilePath != "" {
+		// 保存原始文件路径用于清理匹配
+		originalBaseName := filepath.Base(cfg.FilePath)
+
 		if err := globalLogger.openFile(); err != nil {
 			return fmt.Errorf("打开日志文件失败：%w", err)
 		}
 		globalLogger.useFile = true
 
 		// 清理旧日志文件
-		globalLogger.cleanupOldLogs(cfg.MaxFiles)
+		globalLogger.cleanupOldLogs(cfg.MaxFiles, originalBaseName)
 
 		// 启动定时刷盘
 		globalLogger.flushTicker = time.NewTicker(cfg.FlushInterval)
+		globalLogger.wg.Add(1)
 		go globalLogger.flushLoop()
 	}
 
@@ -157,11 +162,10 @@ func (l *Logger) generateLogFilePath() string {
 }
 
 // cleanupOldLogs 清理旧日志文件，只保留最近 N 个
-func (l *Logger) cleanupOldLogs(maxFiles int) {
+func (l *Logger) cleanupOldLogs(maxFiles int, originalBaseName string) {
 	dir := filepath.Dir(l.filePath)
-	baseName := filepath.Base(l.filePath)
-	ext := filepath.Ext(baseName)
-	nameWithoutExt := strings.TrimSuffix(baseName, ext)
+	ext := filepath.Ext(originalBaseName)
+	nameWithoutExt := strings.TrimSuffix(originalBaseName, ext)
 
 	// 读取目录中的所有日志文件
 	entries, err := os.ReadDir(dir)
@@ -212,6 +216,7 @@ func (l *Logger) cleanupOldLogs(maxFiles int) {
 
 // flushLoop 定时刷盘循环
 func (l *Logger) flushLoop() {
+	defer l.wg.Done()
 	for {
 		select {
 		case <-l.flushTicker.C:
@@ -237,30 +242,51 @@ func Close() error {
 		return nil
 	}
 
-	globalLogger.mu.Lock()
-	defer globalLogger.mu.Unlock()
+	l := globalLogger
+
+	l.mu.Lock()
 
 	// 停止刷盘循环
-	if globalLogger.flushTicker != nil {
-		globalLogger.flushTicker.Stop()
+	if l.flushTicker != nil {
+		l.flushTicker.Stop()
 		select {
-		case <-globalLogger.closeChan:
+		case <-l.closeChan:
 		default:
-			close(globalLogger.closeChan)
+			close(l.closeChan)
 		}
 	}
 
+	l.mu.Unlock()
+
+	// 等待 flushLoop goroutine 退出
+	l.wg.Wait()
+
+	l.mu.Lock()
+
 	// 最后一次刷盘
-	if globalLogger.writer != nil {
-		globalLogger.writer.Flush()
+	if l.writer != nil {
+		l.writer.Flush()
 	}
 
 	// 关闭文件
-	if globalLogger.file != nil {
-		return globalLogger.file.Close()
+	var err error
+	if l.file != nil {
+		err = l.file.Close()
 	}
 
-	return nil
+	// 重置状态
+	l.useFile = false
+	l.useConsole = false
+	l.file = nil
+	l.writer = nil
+	l.flushTicker = nil
+
+	l.mu.Unlock()
+
+	// 最后将全局引用置 nil
+	globalLogger = nil
+
+	return err
 }
 
 // String 日志级别转字符串
@@ -297,6 +323,10 @@ func SetPrefix(prefix string) {
 
 // output 输出日志
 func (l *Logger) output(level Level, format string, args ...interface{}) {
+	if l == nil {
+		return
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -375,13 +405,6 @@ func Error(format string, args ...interface{}) {
 // Fatal 输出 FATAL 级别日志并退出
 func Fatal(format string, args ...interface{}) {
 	globalLogger.output(FATAL, format, args...)
-}
-
-// WithPrefix 创建带前缀的日志
-func WithPrefix(prefix string) {
-	globalLogger.mu.Lock()
-	defer globalLogger.mu.Unlock()
-	globalLogger.prefix = prefix
 }
 
 // ResetPrefix 重置日志前缀

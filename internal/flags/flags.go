@@ -110,41 +110,36 @@ func (fs *FlagSet) DefineInt(name, short string, defaultValue int, usage string)
 	}
 }
 
-// Parse 解析命令行参数
+// Parse 解析命令行参数（从 os.Args）
 func (fs *FlagSet) Parse() error {
-	// 如果没有参数，显示帮助
-	if len(os.Args) < 2 {
+	return fs.ParseArgs(os.Args[1:])
+}
+
+// ParseArgs 从指定参数列表解析
+func (fs *FlagSet) ParseArgs(args []string) error {
+	if len(args) == 0 {
 		fs.ShowHelp()
 		return nil
 	}
 
-	// 处理帮助参数
-	for _, arg := range os.Args[1:] {
+	for _, arg := range args {
 		if arg == "-h" || arg == "--help" || arg == "-help" {
 			fs.ShowHelp()
 			return nil
 		}
-		if arg == "--version" || arg == "-version" {
-			// version 参数特殊处理，让 flag 包解析
-			break
-		}
 	}
 
-	// 解析参数
-	if err := fs.flagSet.Parse(os.Args[1:]); err != nil {
+	if err := fs.flagSet.Parse(args); err != nil {
 		return fmt.Errorf("解析参数失败：%w", err)
 	}
 
-	// 验证必需参数
 	for name, f := range fs.flags {
 		if f.Required {
-			value := fs.Get(name)
-			if value == "" || value == f.Value {
+			if !fs.IsSet(name) {
 				return fmt.Errorf("缺少必需参数：-%s", name)
 			}
 		}
 
-		// 执行自定义验证
 		if f.ValidateFunc != nil {
 			value := fs.Get(name)
 			if err := f.ValidateFunc(value); err != nil {

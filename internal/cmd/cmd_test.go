@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/lwdjd/IPFAR/internal/flags"
 )
 
 func TestCommandBasic(t *testing.T) {
@@ -141,7 +143,7 @@ func TestHiddenCommand(t *testing.T) {
 }
 
 func TestRegisterCommands(t *testing.T) {
-	// 测试注册命令
+	ResetCommands()
 	RegisterCommands()
 
 	// 检查根命令是否有子命令
@@ -440,13 +442,14 @@ func TestCommandWithFlags(t *testing.T) {
 		Short: "测试命令",
 	}
 
-	flagsCalled := false
+	testFlagSet := flags.NewFlagSet("serve")
+	testFlagSet.DefineString("config", "c", "config.json", "配置文件路径", false)
+	testFlagSet.DefineInt("port", "p", 8080, "端口")
+
 	root.AddCommand(&Command{
-		Name:  "serve",
-		Short: "服务命令",
-		Flags: func() {
-			flagsCalled = true
-		},
+		Name:    "serve",
+		Short:   "服务命令",
+		FlagSet: testFlagSet,
 		Run: func(args []string) error {
 			return nil
 		},
@@ -456,9 +459,35 @@ func TestCommandWithFlags(t *testing.T) {
 	if err != nil {
 		t.Errorf("执行失败：%v", err)
 	}
+}
 
-	if !flagsCalled {
-		t.Error("Flags 函数应该被调用")
+func TestCommandWithFlagParsing(t *testing.T) {
+	root := &Command{
+		Name:  "test",
+		Short: "测试命令",
+	}
+
+	testFlagSet := flags.NewFlagSet("serve")
+	testFlagSet.DefineInt("port", "p", 8080, "端口")
+
+	var receivedPort int
+	root.AddCommand(&Command{
+		Name:    "serve",
+		Short:   "服务命令",
+		FlagSet: testFlagSet,
+		Run: func(args []string) error {
+			receivedPort = testFlagSet.GetInt("port")
+			return nil
+		},
+	})
+
+	err := root.Execute([]string{"serve", "-port", "9090"})
+	if err != nil {
+		t.Errorf("执行失败：%v", err)
+	}
+
+	if receivedPort != 9090 {
+		t.Errorf("期望 port=9090, 得到 port=%d", receivedPort)
 	}
 }
 
@@ -625,5 +654,72 @@ func TestCommandLongDescription(t *testing.T) {
 
 	if !strings.Contains(output, "这是一个很长的描述") {
 		t.Error("应该显示 Long 描述")
+	}
+}
+
+func TestRegisterCommandsIdempotent(t *testing.T) {
+	ResetCommands()
+	RegisterCommands()
+
+	countBefore := len(RootCommand.Subcommands)
+
+	RegisterCommands()
+
+	countAfter := len(RootCommand.Subcommands)
+
+	if countBefore != countAfter {
+		t.Errorf("重复注册后命令数量变化：之前 %d，之后 %d", countBefore, countAfter)
+	}
+}
+
+func TestVersionCommand(t *testing.T) {
+	ResetCommands()
+	RegisterCommands()
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := RootCommand.Execute([]string{"version"})
+
+	w.Close()
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	if err != nil {
+		t.Errorf("version 命令执行失败：%v", err)
+	}
+
+	if !strings.Contains(output, "IPFAR") {
+		t.Error("version 输出应包含 IPFAR")
+	}
+}
+
+func TestVersionFlag(t *testing.T) {
+	ResetCommands()
+	RegisterCommands()
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := RootCommand.Execute([]string{"--version"})
+
+	w.Close()
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	if err != nil {
+		t.Errorf("--version 执行失败：%v", err)
+	}
+
+	if !strings.Contains(output, "IPFAR") {
+		t.Error("--version 输出应包含 IPFAR")
 	}
 }

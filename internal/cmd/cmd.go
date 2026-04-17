@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
+
+	"github.com/lwdjd/IPFAR/config"
+	"github.com/lwdjd/IPFAR/internal/flags"
+	"github.com/lwdjd/IPFAR/internal/version"
 )
 
 // Command 子命令定义
@@ -15,7 +18,7 @@ type Command struct {
 	Usage       string                    // 使用说明
 	Args        int                       // 参数数量要求：0=无参数，-1=任意数量，>0=固定数量
 	Run         func(args []string) error // 执行函数
-	Flags       func()                    // 注册标志的函数
+	FlagSet     *flags.FlagSet            // 标志集合
 	Hidden      bool                      // 是否在帮助中隐藏
 	Subcommands []*Command                // 子命令
 }
@@ -27,6 +30,9 @@ var RootCommand = &Command{
 	Long:  "IPFAR 是一个去中心化的数据存储协议桥接工具，用于 IPFS 和 Arweave 之间的数据桥接。",
 }
 
+// commandsRegistered 防止重复注册
+var commandsRegistered bool
+
 // AddCommand 添加子命令
 func (c *Command) AddCommand(cmd *Command) {
 	c.Subcommands = append(c.Subcommands, cmd)
@@ -36,6 +42,16 @@ func (c *Command) AddCommand(cmd *Command) {
 func (c *Command) Execute(args []string) error {
 	if len(args) == 0 {
 		// 没有子命令，显示帮助
+		c.PrintHelp()
+		return nil
+	}
+
+	// 处理全局标志
+	if args[0] == "--version" || args[0] == "-v" {
+		fmt.Println(version.String())
+		return nil
+	}
+	if args[0] == "--help" || args[0] == "-h" {
 		c.PrintHelp()
 		return nil
 	}
@@ -51,8 +67,8 @@ func (c *Command) Execute(args []string) error {
 				subCmdName := args[1]
 				for _, subCmd := range cmd.Subcommands {
 					if subCmd.Name == subCmdName {
-						if subCmd.Flags != nil {
-							subCmd.Flags()
+						if subCmd.FlagSet != nil {
+							subCmd.FlagSet.ParseArgs(args[2:])
 						}
 
 						// 检查参数数量
@@ -77,16 +93,18 @@ func (c *Command) Execute(args []string) error {
 			}
 
 			// 没有子命令或没有提供子命令，执行当前命令
-			if cmd.Flags != nil {
-				cmd.Flags()
+			if cmd.FlagSet != nil {
+				cmd.FlagSet.ParseArgs(args[1:])
 			}
 
-			// 检查参数数量
-			if cmd.Args == 0 && len(args) > 1 {
-				return fmt.Errorf("命令 %s 不接受参数", cmd.Name)
-			}
-			if cmd.Args > 0 && len(args)-1 != cmd.Args {
-				return fmt.Errorf("命令 %s 需要 %d 个参数", cmd.Name, cmd.Args)
+			// 检查参数数量（有 FlagSet 的命令跳过参数数量检查，因为 flag 参数是合法的）
+			if cmd.FlagSet == nil {
+				if cmd.Args == 0 && len(args) > 1 {
+					return fmt.Errorf("命令 %s 不接受参数", cmd.Name)
+				}
+				if cmd.Args > 0 && len(args)-1 != cmd.Args {
+					return fmt.Errorf("命令 %s 需要 %d 个参数", cmd.Name, cmd.Args)
+				}
 			}
 
 			// 执行命令
@@ -181,15 +199,25 @@ func (c *Command) FindCommand(name string) *Command {
 	return nil
 }
 
+// ResetCommands 重置命令注册（仅用于测试）
+func ResetCommands() {
+	RootCommand.Subcommands = nil
+	commandsRegistered = false
+}
+
 // RegisterCommands 注册所有命令
 func RegisterCommands() {
+	if commandsRegistered {
+		return
+	}
+	commandsRegistered = true
 	// version 命令
 	RootCommand.AddCommand(&Command{
 		Name:  "version",
 		Short: "显示版本信息",
 		Long:  "显示 IPFAR 的版本信息",
 		Run: func(args []string) error {
-			fmt.Println("IPFAR v1.0.0")
+			fmt.Println(version.String())
 			return nil
 		},
 	})
@@ -225,14 +253,27 @@ func RegisterCommands() {
 	})
 
 	// serve 命令
+	serveFlagSet := flags.NewFlagSet("serve")
+	serveFlagSet.DefineString("config", "c", "config.json", "配置文件路径", false)
+	serveFlagSet.DefineInt("port", "p", 8080, "服务监听端口")
+	serveFlagSet.DefineBool("verbose", "v", false, "启用详细输出")
+
 	RootCommand.AddCommand(&Command{
-		Name:  "serve",
-		Short: "启动服务",
-		Long:  "启动 IPFAR 桥接服务",
-		Usage: "[选项]",
+		Name:    "serve",
+		Short:   "启动服务",
+		Long:    "启动 IPFAR 桥接服务",
+		Usage:   "[选项]",
+		FlagSet: serveFlagSet,
 		Run: func(args []string) error {
-			fmt.Println("启动 IPFAR 服务...")
-			fmt.Println("服务已启动，监听端口：8080")
+			port := serveFlagSet.GetInt("port")
+			configFile := serveFlagSet.GetString("config")
+			verbose := serveFlagSet.GetBool("verbose")
+			fmt.Printf("启动 IPFAR 服务...\n")
+			fmt.Printf("配置文件：%s\n", configFile)
+			fmt.Printf("服务已启动，监听端口：%d\n", port)
+			if verbose {
+				fmt.Println("详细模式已启用")
+			}
 			return nil
 		},
 	})
@@ -259,10 +300,16 @@ func RegisterCommands() {
 		Name:  "show",
 		Short: "显示当前配置",
 		Run: func(args []string) error {
+			if config.ConfigFile == nil {
+				fmt.Println("配置未加载")
+				return nil
+			}
 			fmt.Println("当前配置：")
-			fmt.Println("  语言：zh_CN")
-			fmt.Println("  日志级别：info")
-			fmt.Println("  日志文件：logs/ipfar.log")
+			fmt.Printf("  语言：%s\n", config.ConfigFile.Language)
+			fmt.Printf("  日志级别：%s\n", config.ConfigFile.LogLevel)
+			fmt.Printf("  日志文件：%s\n", config.ConfigFile.LogFile)
+			fmt.Printf("  控制台输出：%v\n", config.ConfigFile.LogToConsole)
+			fmt.Printf("  日志格式：%s\n", config.ConfigFile.LogFormat)
 			return nil
 		},
 	})
@@ -298,12 +345,10 @@ func Run() error {
 			return nil
 		}
 
-		// 处理 --version
-		if args[0] == "--version" || args[0] == "-v" && !strings.HasPrefix(args[0], "-") {
-			if args[0] == "--version" {
-				fmt.Println("IPFAR v1.0.0")
-				return nil
-			}
+		// 处理 --version / -v
+		if args[0] == "--version" || args[0] == "-v" {
+			fmt.Println(version.String())
+			return nil
 		}
 	}
 
