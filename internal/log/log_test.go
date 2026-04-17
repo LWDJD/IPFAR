@@ -102,11 +102,10 @@ func TestLoggerFile(t *testing.T) {
 	if err := Init(cfg); err != nil {
 		t.Fatalf("初始化日志失败：%v", err)
 	}
+	defer Close()
 
 	Info("测试文件日志")
 	Error("测试错误日志")
-
-	time.Sleep(2 * time.Second)
 
 	Close()
 

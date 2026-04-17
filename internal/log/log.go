@@ -40,11 +40,12 @@ type Logger struct {
 	file        *os.File
 	writer      *bufio.Writer
 	useFile     bool
-	useConsole  bool // 是否输出到控制台
+	useConsole  bool
 	useJSON     bool
-	encoding    string // "utf-8" or "gbk"
+	encoding    string
 	closeChan   chan struct{}
 	flushTicker *time.Ticker
+	wg          sync.WaitGroup
 }
 
 // 全局日志实例
@@ -101,6 +102,7 @@ func Init(cfg Config) error {
 
 		// 启动定时刷盘
 		globalLogger.flushTicker = time.NewTicker(cfg.FlushInterval)
+		globalLogger.wg.Add(1)
 		go globalLogger.flushLoop()
 	}
 
@@ -214,6 +216,7 @@ func (l *Logger) cleanupOldLogs(maxFiles int, originalBaseName string) {
 
 // flushLoop 定时刷盘循环
 func (l *Logger) flushLoop() {
+	defer l.wg.Done()
 	for {
 		select {
 		case <-l.flushTicker.C:
@@ -239,36 +242,48 @@ func Close() error {
 		return nil
 	}
 
-	globalLogger.mu.Lock()
-	defer globalLogger.mu.Unlock()
+	l := globalLogger
+
+	l.mu.Lock()
 
 	// 停止刷盘循环
-	if globalLogger.flushTicker != nil {
-		globalLogger.flushTicker.Stop()
+	if l.flushTicker != nil {
+		l.flushTicker.Stop()
 		select {
-		case <-globalLogger.closeChan:
+		case <-l.closeChan:
 		default:
-			close(globalLogger.closeChan)
+			close(l.closeChan)
 		}
 	}
 
+	l.mu.Unlock()
+
+	// 等待 flushLoop goroutine 退出
+	l.wg.Wait()
+
+	l.mu.Lock()
+
 	// 最后一次刷盘
-	if globalLogger.writer != nil {
-		globalLogger.writer.Flush()
+	if l.writer != nil {
+		l.writer.Flush()
 	}
 
 	// 关闭文件
 	var err error
-	if globalLogger.file != nil {
-		err = globalLogger.file.Close()
+	if l.file != nil {
+		err = l.file.Close()
 	}
 
-	// 重置状态，防止 Close 后调用日志函数导致 panic
-	globalLogger.useFile = false
-	globalLogger.useConsole = false
-	globalLogger.file = nil
-	globalLogger.writer = nil
-	globalLogger.flushTicker = nil
+	// 重置状态
+	l.useFile = false
+	l.useConsole = false
+	l.file = nil
+	l.writer = nil
+	l.flushTicker = nil
+
+	l.mu.Unlock()
+
+	// 最后将全局引用置 nil
 	globalLogger = nil
 
 	return err
