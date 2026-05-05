@@ -27,7 +27,7 @@ Arweave ANS-104	捆绑包阅读与验证: https://github.com/ar-io/arbundles  �
 大于100MB的文件依靠存储费缓解；
 桥节点采用均态分布的方式收集数据，采用被动验证模式，仅在收到数据请求时验证数据是否合法；
 采用尽力而为的DHT发布方式，每个文件都可能会被发布，降低冷数据无法访问的可能性；
-采用完全发布的IPNI发布方式，收集到的数据立刻发布到IPNI。
+采用完全发布的IPNI发布方式，收集到的数据立刻发布到IPNI（PASS 已验证，目前无法实现：IPNI 不是 Kubo 默认路由 — Kubo 默认走 DHT，要手动配 Routing.Type=custom 才能查 IPNI，生态兼容性差；Kubo 不跟 HTTP 302 重定向 — trustless gateway 客户端收到 302 直接判 HTTP Found: No，不走重定向）。
 
 相关内容：
 1.zkIFPS：https://zkipfs.vercel.app/  https://x.com/weave_db/status/1970853988045320204  https://www.arweaveoasis.com/new/279c18e6-90da-801a-b0ec-d37f6d23c48f
