@@ -1,3 +1,5 @@
+github.com/LWDJD/ipfar-sdk v0.0.0-20260513012356-0731f65950da h1:KGPOBcg8MQefjHrvljbVfL1/PffNBm+ntSQawVuCKHo=
+github.com/LWDJD/ipfar-sdk v0.0.0-20260513012356-0731f65950da/go.mod h1:4uVuMkkb4MnHYv3C7k00LhnU9ntMAl5gKTiKFsxWq/M=
 github.com/Xuanwo/go-locale v1.1.3 h1:EWZZJJt5rqPHHbqPRH1zFCn5D7xHjjebODctA4aUO3A=
 github.com/Xuanwo/go-locale v1.1.3/go.mod h1:REn+F/c+AtGSWYACBSYZgl23AP+0lfQC+SEFPN+hj30=
 github.com/leonelquinteros/gotext v1.7.2 h1:bDPndU8nt+/kRo1m4l/1OXiiy2v7Z7dfPQ9+YP7G1Mc=
