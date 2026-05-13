@@ -58,7 +58,7 @@ func DefaultServiceConfig() ServiceConfig {
 		MaxBlockHeight:         0, // 动态跟随
 		PollInterval:           2 * time.Minute,
 		CacheDir:               "cache/car",
-		MaxFileSize:            200 * 1024 * 1024,
+		MaxFileSize:            0, // 不限制
 		CarAvailable:           true,
 		OnlineVerify:           false,
 		OnlineSampleCount:      5,
