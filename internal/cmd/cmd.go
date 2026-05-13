@@ -308,7 +308,7 @@ func RegisterCommands() {
 				VerifyReferenceChain: verifyRef,
 				VerifyIntegrity:      verifyIntegrity,
 				CacheDir:             cacheDir,
-				MaxFileSize:          200 * 1024 * 1024,
+				MaxFileSize:          0,
 				CarAvailable:         true,
 			}
 			if gateway != "" {
@@ -578,7 +578,7 @@ func RegisterCommands() {
 				VerifyReferenceChain: verifyRef,
 				VerifyIntegrity:      verifyIntegrity,
 				CacheDir:             cacheDir,
-				MaxFileSize:          200 * 1024 * 1024,
+				MaxFileSize:          0,
 				CarAvailable:         !noCar,
 			}
 			if gateway != "" {
