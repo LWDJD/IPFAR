@@ -192,18 +192,17 @@ func TestService_ProcessMetadataFromBase64(t *testing.T) {
 }
 
 func TestService_ProcessMetadataTX_WithMockServer(t *testing.T) {
+	carData := []byte("mock-car-binary-data-for-service-test")
 	metaData := sdkmeta.Metadata{
 		Version:    1,
 		Method:     "raw",
 		RootCID:    "bafkreitestservicetxidabcd1234abcd1234abcd1234ab",
 		DataTXID:   "txservicetest1234567890123456789012345678901234",
 		DataHeight: 500,
-		DataSize:   2048,
+		DataSize:   len(carData),
 		PoW:        "servicesalt",
 		PoWAlg:     "argon2idlightv1",
 	}
-
-	carData := []byte("mock-car-binary-data-for-service-test")
 
 	server := setupMockServer(t, metaData, carData)
 	defer server.Close()
@@ -469,18 +468,17 @@ func TestService_Stop(t *testing.T) {
 }
 
 func TestService_DownloadCAR_Integration(t *testing.T) {
+	carData := []byte("integration-car-data-content")
 	metaData := sdkmeta.Metadata{
 		Version:    1,
 		Method:     "raw",
 		RootCID:    "bafkreidownloadtestabcd1234abcd1234abcd1234abcd12",
 		DataTXID:   "txdownloadtestid123456789012345678901234567890123",
 		DataHeight: 10,
-		DataSize:   100,
+		DataSize:   len(carData),
 		PoW:        "downloadsalt",
 		PoWAlg:     "argon2idlightv1",
 	}
-
-	carData := []byte("integration-car-data-content")
 
 	server := setupMockServer(t, metaData, carData)
 	defer server.Close()
