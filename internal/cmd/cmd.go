@@ -10,6 +10,7 @@ import (
 	"github.com/lwdjd/IPFAR/config"
 	"github.com/lwdjd/IPFAR/internal/bridge"
 	"github.com/lwdjd/IPFAR/internal/flags"
+	"github.com/lwdjd/IPFAR/internal/log"
 	"github.com/lwdjd/IPFAR/internal/version"
 
 	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
@@ -262,24 +263,65 @@ func RegisterCommands() {
 	serveFlagSet.DefineString("config", "c", "config.json", "配置文件路径", false)
 	serveFlagSet.DefineInt("port", "p", 8080, "服务监听端口")
 	serveFlagSet.DefineBool("verbose", "v", false, "启用详细输出")
+	serveFlagSet.DefineString("preset", "", "light", "安全预设：strict/balanced/light/trusted", false)
+	serveFlagSet.DefineString("gateway", "", "https://arweave.net", "Arweave 网关 URL", false)
+	serveFlagSet.DefineString("cache-dir", "", "cache/car", "CAR 文件缓存目录", false)
 
 	RootCommand.AddCommand(&Command{
 		Name:    "serve",
-		Short:   "启动服务",
-		Long:    "启动 IPFAR 桥接服务",
+		Short:   "启动桥接服务",
+		Long:    "启动 IPFAR 桥接服务，运行发现→下载→验证主循环",
 		Usage:   "[选项]",
 		FlagSet: serveFlagSet,
 		Run: func(args []string) error {
-			port := serveFlagSet.GetInt("port")
 			configFile := serveFlagSet.GetString("config")
+			port := serveFlagSet.GetInt("port")
 			verbose := serveFlagSet.GetBool("verbose")
-			fmt.Printf("启动 IPFAR 服务...\n")
-			fmt.Printf("配置文件：%s\n", configFile)
-			fmt.Printf("服务已启动，监听端口：%d\n", port)
+			preset := serveFlagSet.GetString("preset")
+			gateway := serveFlagSet.GetString("gateway")
+			cacheDir := serveFlagSet.GetString("cache-dir")
+
 			if verbose {
-				fmt.Println("详细模式已启用")
+				config.ConfigFile.LogLevel = "debug"
+				config.InitLog()
 			}
-			return nil
+
+			fmt.Printf("╔══════════════════════════════════╗\n")
+			fmt.Printf("║       IPFAR 桥接服务 v%s       ║\n", version.Short())
+			fmt.Printf("╠══════════════════════════════════╣\n")
+			fmt.Printf("║ 配置文件:  %-20s ║\n", configFile)
+			fmt.Printf("║ 监听端口:  %-20d ║\n", port)
+			fmt.Printf("║ 安全预设:  %-20s ║\n", preset)
+			fmt.Printf("║ 网关地址:  %-20s ║\n", gateway)
+			fmt.Printf("║ 缓存目录:  %-20s ║\n", cacheDir)
+			fmt.Printf("╚══════════════════════════════════╝\n\n")
+
+			verifyPoW, verifyIndex, verifyRef, verifyIntegrity := config.ConfigFile.GetVerifyConfig()
+
+			log.Info("验证配置：pow=%v index=%v ref=%v integrity=%v",
+				verifyPoW, verifyIndex, verifyRef, verifyIntegrity)
+
+			svcCfg := bridge.ServiceConfig{
+				Preset:               preset,
+				VerifyPoW:            verifyPoW,
+				VerifyIndex:          verifyIndex,
+				VerifyReferenceChain: verifyRef,
+				VerifyIntegrity:      verifyIntegrity,
+				CacheDir:             cacheDir,
+				MaxFileSize:          200 * 1024 * 1024,
+				CarAvailable:         true,
+			}
+			if gateway != "" {
+				svcCfg.GatewayURLs = []string{gateway}
+			}
+
+			svc, err := bridge.NewService(svcCfg)
+			if err != nil {
+				return fmt.Errorf("创建服务失败: %w", err)
+			}
+
+			log.Info("桥接服务已启动，按 Ctrl+C 停止")
+			return svc.Start()
 		},
 	})
 
@@ -503,6 +545,71 @@ func RegisterCommands() {
 	})
 
 	RootCommand.AddCommand(verifyCmd)
+
+	// run 命令：端到端处理单个元数据交易
+	runFlagSet := flags.NewFlagSet("run")
+	runFlagSet.DefineString("preset", "", "light", "安全预设：strict/balanced/light/trusted", false)
+	runFlagSet.DefineString("gateway", "", "https://arweave.net", "Arweave 网关 URL", false)
+	runFlagSet.DefineString("cache-dir", "", "cache/car", "CAR 文件缓存目录", false)
+	runFlagSet.DefineBool("no-car", "", false, "不下载 CAR 文件（仅快速验证）")
+	runFlagSet.DefineBool("quiet", "q", false, "静默模式（仅输出结果）")
+
+	RootCommand.AddCommand(&Command{
+		Name:    "run",
+		Short:   "运行完整验证链路",
+		Long:    "端到端处理：获取元数据交易 → 解析 → 下载 CAR → 验证管道",
+		Usage:   "<metadata-txid>",
+		Args:    1,
+		FlagSet: runFlagSet,
+		Run: func(args []string) error {
+			txID := args[0]
+			preset := runFlagSet.GetString("preset")
+			gateway := runFlagSet.GetString("gateway")
+			cacheDir := runFlagSet.GetString("cache-dir")
+			noCar := runFlagSet.GetBool("no-car")
+			quiet := runFlagSet.GetBool("quiet")
+
+			verifyPoW, verifyIndex, verifyRef, verifyIntegrity := config.ConfigFile.GetVerifyConfig()
+
+			svcCfg := bridge.ServiceConfig{
+				Preset:               preset,
+				VerifyPoW:            verifyPoW,
+				VerifyIndex:          verifyIndex,
+				VerifyReferenceChain: verifyRef,
+				VerifyIntegrity:      verifyIntegrity,
+				CacheDir:             cacheDir,
+				MaxFileSize:          200 * 1024 * 1024,
+				CarAvailable:         !noCar,
+			}
+			if gateway != "" {
+				svcCfg.GatewayURLs = []string{gateway}
+			}
+
+			svc, err := bridge.NewService(svcCfg)
+			if err != nil {
+				return fmt.Errorf("创建服务失败: %w", err)
+			}
+
+			if !quiet {
+				fmt.Printf("处理元数据交易: %s\n", txID)
+				fmt.Printf("安全预设: %s\n", preset)
+				fmt.Printf("下载 CAR: %v\n", !noCar)
+				fmt.Println()
+			}
+
+			result, err := svc.ProcessMetadataTX(txID)
+			if err != nil {
+				return err
+			}
+
+			fmt.Print(bridge.FormatResult(result))
+
+			if result.Passed {
+				return nil
+			}
+			return fmt.Errorf("验证失败")
+		},
+	})
 }
 
 // Run 运行命令（从 os.Args 解析）
