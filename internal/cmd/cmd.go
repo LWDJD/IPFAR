@@ -266,6 +266,10 @@ func RegisterCommands() {
 	serveFlagSet.DefineString("preset", "", "light", "安全预设：strict/balanced/light/trusted", false)
 	serveFlagSet.DefineString("gateway", "", "https://arweave.net", "Arweave 网关 URL", false)
 	serveFlagSet.DefineString("cache-dir", "", "cache/car", "CAR 文件缓存目录", false)
+	serveFlagSet.DefineBool("online-verify", "", false, "启用在线验证（HTTP Range 采样，不存盘）")
+	serveFlagSet.DefineInt("online-sample", "", 5, "在线验证随机采样 block 数量")
+	serveFlagSet.DefineInt("online-concurrency", "", 4, "在线验证最大并发数")
+	serveFlagSet.DefineInt("download-concurrency", "", 2, "完整下载最大并发数")
 
 	RootCommand.AddCommand(&Command{
 		Name:    "serve",
@@ -280,6 +284,10 @@ func RegisterCommands() {
 			preset := serveFlagSet.GetString("preset")
 			gateway := serveFlagSet.GetString("gateway")
 			cacheDir := serveFlagSet.GetString("cache-dir")
+			onlineVerify := serveFlagSet.GetBool("online-verify")
+			onlineSample := serveFlagSet.GetInt("online-sample")
+			onlineConcurrency := serveFlagSet.GetInt("online-concurrency")
+			downloadConcurrency := serveFlagSet.GetInt("download-concurrency")
 
 			if verbose {
 				config.ConfigFile.LogLevel = "debug"
@@ -302,14 +310,18 @@ func RegisterCommands() {
 				verifyPoW, verifyIndex, verifyRef, verifyIntegrity)
 
 			svcCfg := bridge.ServiceConfig{
-				Preset:               preset,
-				VerifyPoW:            verifyPoW,
-				VerifyIndex:          verifyIndex,
-				VerifyReferenceChain: verifyRef,
-				VerifyIntegrity:      verifyIntegrity,
-				CacheDir:             cacheDir,
-				MaxFileSize:          200 * 1024 * 1024,
-				CarAvailable:         true,
+				Preset:                 preset,
+				VerifyPoW:              verifyPoW,
+				VerifyIndex:            verifyIndex,
+				VerifyReferenceChain:   verifyRef,
+				VerifyIntegrity:        verifyIntegrity,
+				CacheDir:               cacheDir,
+				MaxFileSize:            200 * 1024 * 1024,
+				CarAvailable:           !onlineVerify,
+				OnlineVerify:           onlineVerify,
+				OnlineSampleCount:      onlineSample,
+				OnlineMaxConcurrency:   onlineConcurrency,
+				DownloadMaxConcurrency: downloadConcurrency,
 			}
 			if gateway != "" {
 				svcCfg.GatewayURLs = []string{gateway}
@@ -552,6 +564,8 @@ func RegisterCommands() {
 	runFlagSet.DefineString("gateway", "", "https://arweave.net", "Arweave 网关 URL", false)
 	runFlagSet.DefineString("cache-dir", "", "cache/car", "CAR 文件缓存目录", false)
 	runFlagSet.DefineBool("no-car", "", false, "不下载 CAR 文件（仅快速验证）")
+	runFlagSet.DefineBool("online-verify", "", false, "启用在线验证（HTTP Range 采样，不存盘）")
+	runFlagSet.DefineInt("online-sample", "", 5, "在线验证随机采样 block 数量")
 	runFlagSet.DefineBool("quiet", "q", false, "静默模式（仅输出结果）")
 
 	RootCommand.AddCommand(&Command{
@@ -567,6 +581,8 @@ func RegisterCommands() {
 			gateway := runFlagSet.GetString("gateway")
 			cacheDir := runFlagSet.GetString("cache-dir")
 			noCar := runFlagSet.GetBool("no-car")
+			onlineVerify := runFlagSet.GetBool("online-verify")
+			onlineSample := runFlagSet.GetInt("online-sample")
 			quiet := runFlagSet.GetBool("quiet")
 
 			verifyPoW, verifyIndex, verifyRef, verifyIntegrity := config.ConfigFile.GetVerifyConfig()
@@ -579,7 +595,9 @@ func RegisterCommands() {
 				VerifyIntegrity:      verifyIntegrity,
 				CacheDir:             cacheDir,
 				MaxFileSize:          200 * 1024 * 1024,
-				CarAvailable:         !noCar,
+				CarAvailable:         !noCar && !onlineVerify,
+				OnlineVerify:         onlineVerify,
+				OnlineSampleCount:    onlineSample,
 			}
 			if gateway != "" {
 				svcCfg.GatewayURLs = []string{gateway}

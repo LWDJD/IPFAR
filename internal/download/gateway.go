@@ -117,6 +117,18 @@ func (g *Gateway) FetchChunk(txID string, offset int64) ([]byte, error) {
 	})
 }
 
+// FetchRange 获取指定交易的指定字节范围数据
+// txID: 交易 ID
+// offset: 起始偏移量（字节，从 0 开始）
+// length: 读取长度（字节）
+func (g *Gateway) FetchRange(txID string, offset, length int64) ([]byte, error) {
+	path := fmt.Sprintf("/%s", txID)
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	return g.fetchWithHeaders(path, map[string]string{
+		"Range": rangeHeader,
+	})
+}
+
 // HeadTransaction 获取交易头信息（不下载完整数据）
 func (g *Gateway) HeadTransaction(txID string) (http.Header, error) {
 	path := fmt.Sprintf("/%s", txID)
