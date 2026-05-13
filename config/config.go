@@ -12,6 +12,15 @@ type Config struct {
 	LogFile      string `json:"log_file,omitempty"`       // 日志文件路径（可选）
 	LogToConsole bool   `json:"log_to_console,omitempty"` // 是否输出到控制台（默认 false）
 	LogFormat    string `json:"log_format,omitempty"`     // 日志格式：text, json
+
+	// 验证选项（规范 §4.1）
+	VerifyPoW            bool `json:"verify_pow,omitempty"`             // PoW 验证开关
+	VerifyIndex          bool `json:"verify_index,omitempty"`           // Index 完整性验证开关
+	VerifyReferenceChain bool `json:"verify_reference_chain,omitempty"` // 引用链验证开关
+	VerifyIntegrity      bool `json:"verify_integrity,omitempty"`       // 数据完整性验证开关
+
+	// 安全等级预设（如果设置，将覆盖上述单独选项）
+	SecurityPreset string `json:"security_preset,omitempty"` // strict, balanced, light, trusted
 }
 
 // ConfigFile 全局配置文件实例
@@ -68,4 +77,26 @@ func InitLog() error {
 	log.Info("控制台输出：%v", ConfigFile.LogToConsole)
 
 	return nil
+}
+
+// GetVerifyConfig 从配置中获取验证配置
+// 如果设置了 security_preset，则使用预设值覆盖单独选项
+func (c *Config) GetVerifyConfig() (verifyPoW, verifyIndex, verifyRef, verifyIntegrity bool) {
+	// 默认值：light 模式
+	if c.SecurityPreset == "" && !c.VerifyPoW && !c.VerifyIndex && !c.VerifyReferenceChain && !c.VerifyIntegrity {
+		return true, false, true, false // light: PoW + Ref chain
+	}
+
+	switch c.SecurityPreset {
+	case "strict":
+		return true, true, true, true
+	case "balanced":
+		return true, true, false, true
+	case "light":
+		return true, false, true, false
+	case "trusted":
+		return false, false, false, false
+	default:
+		return c.VerifyPoW, c.VerifyIndex, c.VerifyReferenceChain, c.VerifyIntegrity
+	}
 }

@@ -1,13 +1,18 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 
 	"github.com/lwdjd/IPFAR/config"
+	"github.com/lwdjd/IPFAR/internal/bridge"
 	"github.com/lwdjd/IPFAR/internal/flags"
 	"github.com/lwdjd/IPFAR/internal/version"
+
+	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
 )
 
 // Command 子命令定义
@@ -326,6 +331,178 @@ func RegisterCommands() {
 	})
 
 	RootCommand.AddCommand(configCmd)
+
+	// verify 命令组
+	verifyCmd := &Command{
+		Name:  "verify",
+		Short: "验证工具",
+		Long:  "IPFAR 数据验证工具集",
+	}
+
+	// verify metadata 子命令
+	verifyMetadataFlagSet := flags.NewFlagSet("verify-metadata")
+	verifyMetadataFlagSet.DefineBool("json", "j", false, "输入为原始 JSON（默认：Base64URL 编码）")
+
+	verifyCmd.AddCommand(&Command{
+		Name:    "metadata",
+		Short:   "验证元数据",
+		Long:    "验证 IPFAR 元数据的合法性和完整性",
+		Usage:   "<元数据字符串>",
+		Args:    1,
+		FlagSet: verifyMetadataFlagSet,
+		Run: func(args []string) error {
+			isJSON := verifyMetadataFlagSet.GetBool("json")
+
+			verifyPoW, verifyIdx, verifyRef, verifyIntegrity := config.ConfigFile.GetVerifyConfig()
+			b := bridge.NewBridge(verifyPoW, verifyIdx, verifyRef, verifyIntegrity)
+
+			var meta *sdkmeta.Metadata
+			var err error
+
+			if isJSON {
+				meta, err = b.VerifyMetadata([]byte(args[0]))
+			} else {
+				meta, err = b.VerifyMetadataFromBase64(args[0])
+			}
+
+			if err != nil {
+				return err
+			}
+
+			// 运行验证管道
+			result := b.RunPipeline(meta, false)
+			fmt.Print(bridge.PrintPipelineResult(result))
+
+			// 显示解析后的元数据
+			formatted, _ := bridge.FormatMetadataJSON(meta)
+			fmt.Println("\n解析后的元数据：")
+			fmt.Println(formatted)
+
+			return nil
+		},
+	})
+
+	// verify pow 子命令
+	verifyPoWFlagSet := flags.NewFlagSet("verify-pow")
+	verifyPoWFlagSet.DefineString("root-cid", "r", "", "根 CID（Base32）", true)
+	verifyPoWFlagSet.DefineString("data-txid", "t", "", "数据交易 ID", true)
+	verifyPoWFlagSet.DefineString("data-size", "s", "", "原始数据大小（字节）", true)
+	verifyPoWFlagSet.DefineString("pow", "p", "", "PoW salt 值", false)
+	verifyPoWFlagSet.DefineString("pow-alg", "a", "argon2id-light-v1", "PoW 算法标识", false)
+
+	verifyCmd.AddCommand(&Command{
+		Name:    "pow",
+		Short:   "验证工作量证明",
+		Long:    "验证 Argon2id PoW 是否满足难度要求",
+		Usage:   "[选项]",
+		FlagSet: verifyPoWFlagSet,
+		Run: func(args []string) error {
+			rootCID := verifyPoWFlagSet.GetString("root-cid")
+			dataTXID := verifyPoWFlagSet.GetString("data-txid")
+			dataSizeStr := verifyPoWFlagSet.GetString("data-size")
+			powStr := verifyPoWFlagSet.GetString("pow")
+			powAlg := verifyPoWFlagSet.GetString("pow-alg")
+
+			if rootCID == "" || dataTXID == "" || dataSizeStr == "" {
+				return fmt.Errorf("必须提供 --root-cid, --data-txid, --data-size 参数")
+			}
+
+			dataSize, err := strconv.ParseInt(dataSizeStr, 10, 64)
+			if err != nil {
+				return fmt.Errorf("无效的 data-size: %v", err)
+			}
+
+			verifyPoW, _, _, _ := config.ConfigFile.GetVerifyConfig()
+			b := bridge.NewBridge(verifyPoW, false, false, false)
+
+			meta := &sdkmeta.Metadata{
+				RootCID:  rootCID,
+				DataTXID: dataTXID,
+				DataSize: int(dataSize),
+				PoW:      powStr,
+				PoWAlg:   powAlg,
+			}
+
+			if err := b.VerifyPoW(meta); err != nil {
+				return err
+			}
+
+			fmt.Println("✅ PoW 验证通过")
+			if dataSize >= 100*1024*1024 {
+				fmt.Println("（文件大小 >= 100 MiB，免 PoW 验证）")
+			} else {
+				fmt.Printf("   Root CID: %s\n", rootCID)
+
+				fmt.Printf("   Data TXID: %s\n", dataTXID)
+
+				fmt.Printf("   PoW salt: %s\n", powStr)
+
+			}
+
+			return nil
+		},
+	})
+
+	// verify config 子命令
+	verifyCmd.AddCommand(&Command{
+		Name:  "config",
+		Short: "显示验证配置",
+		Long:  "显示当前的验证选项配置",
+		Run: func(args []string) error {
+			verifyPoW, verifyIdx, verifyRef, verifyIntegrity := config.ConfigFile.GetVerifyConfig()
+
+			fmt.Println("当前验证配置：")
+			fmt.Printf("  verify_pow:             %v\n", verifyPoW)
+
+			fmt.Printf("  verify_index:           %v\n", verifyIdx)
+
+			fmt.Printf("  verify_reference_chain: %v\n", verifyRef)
+
+			fmt.Printf("  verify_integrity:        %v\n", verifyIntegrity)
+
+
+			if config.ConfigFile.SecurityPreset != "" {
+				fmt.Printf("  security_preset:        %s\n", config.ConfigFile.SecurityPreset)
+
+			}
+
+			// 显示 PoW 参数
+			info := bridge.GetPoWInfo()
+			fmt.Println()
+			fmt.Println("PoW 参数：")
+			fmt.Printf("  算法：%s\n", info.Algorithm)
+
+			fmt.Printf("  内存：%s\n", info.Memory)
+
+			fmt.Printf("  难度：%d 字节前导零\n", info.MinLeadingZeroBytes)
+
+			fmt.Printf("  阈值：%s\n", info.Threshold)
+
+
+			return nil
+		},
+	})
+
+	// verify tags 子命令
+	verifyCmd.AddCommand(&Command{
+		Name:  "tags",
+		Short: "验证 Transaction Tags",
+		Long:  "验证 Arweave Transaction Tags 是否符合 IPFAR 规范",
+		Usage: "<tag_json>",
+		Args:  1,
+		Run: func(args []string) error {
+			tags, err := sdkmeta.ParseJSON([]byte(args[0]))
+			if err != nil {
+				// 尝试作为 tags 数组解析
+				return verifyTagsFromJSON(args[0])
+			}
+
+			_ = tags
+			return verifyTagsFromJSON(args[0])
+		},
+	})
+
+	RootCommand.AddCommand(verifyCmd)
 }
 
 // Run 运行命令（从 os.Args 解析）
@@ -353,4 +530,25 @@ func Run() error {
 	}
 
 	return RootCommand.Execute(args)
+}
+
+// verifyTagsFromJSON 从 JSON 字符串解析并验证 Tags
+func verifyTagsFromJSON(tagJSON string) error {
+	var tags []sdkmeta.Tag
+	if err := json.Unmarshal([]byte(tagJSON), &tags); err != nil {
+		return fmt.Errorf("无法解析 Tags JSON: %v。\n预期格式：[{\"name\":\"TagName\",\"value\":\"TagValue\"}, ...]", err)
+	}
+
+	if err := sdkmeta.ValidateTags(tags); err != nil {
+		return fmt.Errorf("Tags 验证失败：%v", err)
+	}
+
+	fmt.Println("✅ Tags 验证通过")
+	fmt.Println()
+	for _, tag := range tags {
+		fmt.Printf("  %-25s = %s\n", tag.Name, tag.Value)
+
+	}
+
+	return nil
 }
