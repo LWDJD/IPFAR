@@ -118,6 +118,18 @@ func (g *Gateway) FetchChunk(txID string, offset int64) ([]byte, error) {
 	})
 }
 
+// FetchRange 获取指定交易的指定字节范围数据
+// txID: 交易 ID
+// offset: 起始偏移量（字节，从 0 开始）
+// length: 读取长度（字节）
+func (g *Gateway) FetchRange(txID string, offset, length int64) ([]byte, error) {
+	path := fmt.Sprintf("/%s", txID)
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	return g.fetchWithHeaders(path, map[string]string{
+		"Range": rangeHeader,
+	})
+}
+
 // FetchToWriter 流式下载交易数据到 io.Writer，返回写入的字节数
 // 与 FetchTransaction 不同，此方法不将全部数据加载到内存，
 // 而是用 32KB 缓冲区流式拷贝到 writer（通常是 *os.File）。
