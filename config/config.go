@@ -22,6 +22,14 @@ type Config struct {
 	// 安全等级预设（如果设置，将覆盖上述单独选项）
 	SecurityPreset string `json:"security_preset,omitempty"` // strict, balanced, light, trusted
 
+	// 网关配置（规范 §3）
+	GatewayList              []string `json:"gateway_list,omitempty"`                // 自定义网关列表
+	GatewayAllowLocal        bool     `json:"gateway_allow_local,omitempty"`         // 是否允许本地网关（默认 false）
+	GatewayHealthCheck       bool     `json:"gateway_health_check,omitempty"`        // 是否启用健康检查（默认 true）
+	GatewayHealthCheckSecs   int      `json:"gateway_health_check_secs,omitempty"`   // 健康检查间隔（秒，默认 60）
+	GatewayTimeoutSecs       int      `json:"gateway_timeout_secs,omitempty"`        // 网关请求超时（秒，默认 30）
+	GatewayMaxRetries        int      `json:"gateway_max_retries,omitempty"`         // 最大重试次数（默认 3）
+
 	// DHT 内容发布配置（规范 P3-1）
 	DHT DHTConfig `json:"dht,omitempty"`
 }
