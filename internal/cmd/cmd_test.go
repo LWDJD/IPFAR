@@ -723,3 +723,236 @@ func TestVersionFlag(t *testing.T) {
 		t.Error("--version 输出应包含 IPFAR")
 	}
 }
+
+// TestFlagSetArgsFiltering_Bug1 测试 Bug #1：FlagSet 解析后剩余参数正确过滤
+func TestFlagSetArgsFiltering_Bug1(t *testing.T) {
+	// 场景1：子命令 + FlagSet + 位置参数
+	// 例如: ipfar verify metadata -j <data>
+	// 修复前：len(args) 校验使用原始 args（含 flags），导致参数数量判断错误
+	// 修复后：使用 flagSet.Args() 进行判断，且 Run 接收过滤后的参数
+
+	root := &Command{Name: "test", Short: "测试"}
+
+	parent := &Command{Name: "verify", Short: "验证"}
+
+	metaFlagSet := flags.NewFlagSet("verify-metadata")
+	metaFlagSet.DefineBool("json", "j", false, "JSON 模式")
+
+	var receivedArgs []string
+	var jsonFlag bool
+	parent.AddCommand(&Command{
+		Name:    "metadata",
+		Short:   "验证元数据",
+		Args:    1,
+		FlagSet: metaFlagSet,
+		Run: func(args []string) error {
+			receivedArgs = args
+			jsonFlag = metaFlagSet.GetBool("json")
+			return nil
+		},
+	})
+
+	root.AddCommand(parent)
+
+	// 执行: verify metadata -j mydata
+	err := root.Execute([]string{"verify", "metadata", "-j", "mydata"})
+	if err != nil {
+		t.Fatalf("执行失败：%v", err)
+	}
+
+	if len(receivedArgs) != 1 {
+		t.Errorf("期望 1 个剩余参数，得到 %d 个：%v", len(receivedArgs), receivedArgs)
+	}
+	if receivedArgs[0] != "mydata" {
+		t.Errorf("期望参数为 'mydata'，得到 '%s'", receivedArgs[0])
+	}
+	if !jsonFlag {
+		t.Error("期望 -j 标志为 true")
+	}
+}
+
+// TestFlagSetArgsFilteringTopLevel_Bug1 测试 Bug #1：顶层命令 + FlagSet + 位置参数
+func TestFlagSetArgsFilteringTopLevel_Bug1(t *testing.T) {
+	// 场景2：顶层命令 + FlagSet + 位置参数
+	// 例如: ipfar run <txid> --preset strict
+
+	root := &Command{Name: "test", Short: "测试"}
+
+	runFlagSet := flags.NewFlagSet("run")
+	runFlagSet.DefineString("preset", "", "light", "预设", false)
+
+	var receivedArgs []string
+	var presetValue string
+	root.AddCommand(&Command{
+		Name:    "run",
+		Short:   "运行",
+		Args:    1,
+		FlagSet: runFlagSet,
+		Run: func(args []string) error {
+			receivedArgs = args
+			presetValue = runFlagSet.GetString("preset")
+			return nil
+		},
+	})
+
+	// 执行: run --preset strict mytxid（flags 必须在位置参数之前）
+	err := root.Execute([]string{"run", "--preset", "strict", "mytxid"})
+	if err != nil {
+		t.Fatalf("执行失败：%v", err)
+	}
+
+	if len(receivedArgs) != 1 {
+		t.Errorf("期望 1 个剩余参数，得到 %d 个：%v", len(receivedArgs), receivedArgs)
+	}
+	if receivedArgs[0] != "mytxid" {
+		t.Errorf("期望参数为 'mytxid'，得到 '%s'", receivedArgs[0])
+	}
+	if presetValue != "strict" {
+		t.Errorf("期望 preset=strict，得到 preset=%s", presetValue)
+	}
+}
+
+// TestFlagOnlyCommand_Bug1 测试 Bug #1：纯 FlagSet 命令（无位置参数）
+func TestFlagOnlyCommand_Bug1(t *testing.T) {
+	// 场景3：只有 FlagSet 没有位置参数的命令
+	// 例如: ipfar verify pow --root-cid x --data-txid y --data-size 100
+	// 修复前：Args=0 但 len(args)>0 导致 "不接受参数" 错误
+
+	root := &Command{Name: "test", Short: "测试"}
+
+	parent := &Command{Name: "verify", Short: "验证"}
+
+	powFlagSet := flags.NewFlagSet("verify-pow")
+	powFlagSet.DefineString("root-cid", "r", "", "根 CID", true)
+	powFlagSet.DefineString("data-txid", "t", "", "数据 TXID", true)
+	powFlagSet.DefineString("data-size", "s", "", "数据大小", true)
+
+	executed := false
+	parent.AddCommand(&Command{
+		Name:    "pow",
+		Short:   "验证 PoW",
+		FlagSet: powFlagSet,
+		Run: func(args []string) error {
+			executed = true
+			return nil
+		},
+	})
+
+	root.AddCommand(parent)
+
+	// 执行: verify pow --root-cid abc --data-txid xyz --data-size 100
+	err := root.Execute([]string{"verify", "pow",
+		"--root-cid", "abc",
+		"--data-txid", "xyz",
+		"--data-size", "100",
+	})
+	if err != nil {
+		t.Fatalf("纯 flag 命令执行失败：%v", err)
+	}
+	if !executed {
+		t.Error("纯 flag 命令的 Run 应该被执行")
+	}
+}
+
+// TestFlagSetHelpStopsExecution_Bug2 测试 Bug #2：--help 阻止 Run 执行
+func TestFlagSetHelpStopsExecution_Bug2(t *testing.T) {
+	// 修复前：--help 显示帮助后 Run 仍然执行（如 serve --help 仍启动服务）
+	// 修复后：ParseArgs 返回 ErrHelpShown，Execute 检查并返回 nil，不执行 Run
+
+	root := &Command{Name: "test", Short: "测试"}
+
+	testFlagSet := flags.NewFlagSet("serve")
+	testFlagSet.DefineInt("port", "p", 8080, "端口")
+
+	runExecuted := false
+	root.AddCommand(&Command{
+		Name:    "serve",
+		Short:   "服务",
+		FlagSet: testFlagSet,
+		Run: func(args []string) error {
+			runExecuted = true
+			return nil
+		},
+	})
+
+	// 执行: serve --help
+	oldStdout := os.Stdout
+	_, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := root.Execute([]string{"serve", "--help"})
+
+	w.Close()
+	os.Stdout = oldStdout
+
+	if err != nil {
+		t.Errorf("--help 不应返回错误：%v", err)
+	}
+	if runExecuted {
+		t.Error("--help 后 Run 不应该被执行！")
+	}
+}
+
+// TestSubcommandFlagSetHelpStopsExecution_Bug2 测试 Bug #2：子命令 --help 阻止 Run 执行
+func TestSubcommandFlagSetHelpStopsExecution_Bug2(t *testing.T) {
+	root := &Command{Name: "test", Short: "测试"}
+
+	parent := &Command{Name: "verify", Short: "验证"}
+
+	testFlagSet := flags.NewFlagSet("test-flags")
+	testFlagSet.DefineBool("json", "j", false, "JSON 模式")
+
+	runExecuted := false
+	parent.AddCommand(&Command{
+		Name:    "check",
+		Short:   "检查",
+		FlagSet: testFlagSet,
+		Args:    1,
+		Run: func(args []string) error {
+			runExecuted = true
+			return nil
+		},
+	})
+
+	root.AddCommand(parent)
+
+	// 执行: verify check --help
+	oldStdout := os.Stdout
+	_, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := root.Execute([]string{"verify", "check", "--help"})
+
+	w.Close()
+	os.Stdout = oldStdout
+
+	if err != nil {
+		t.Errorf("子命令 --help 不应返回错误：%v", err)
+	}
+	if runExecuted {
+		t.Error("子命令 --help 后 Run 不应该被执行！")
+	}
+}
+
+// TestFlagSetArgsRemainAfterParsing 测试 FlagSet.Args() 返回正确的剩余参数
+func TestFlagSetArgsRemainAfterParsing(t *testing.T) {
+	fs := flags.NewFlagSet("test")
+	fs.DefineBool("verbose", "v", false, "详细输出")
+	fs.DefineString("output", "o", "", "输出文件", false)
+
+	err := fs.ParseArgs([]string{"-v", "--output", "out.txt", "file1", "file2"})
+	if err != nil {
+		t.Fatalf("ParseArgs 失败：%v", err)
+	}
+
+	args := fs.Args()
+	if len(args) != 2 {
+		t.Errorf("期望 2 个剩余参数，得到 %d 个：%v", len(args), args)
+	}
+	if args[0] != "file1" || args[1] != "file2" {
+		t.Errorf("剩余参数不正确：%v", args)
+	}
+	if fs.NArg() != 2 {
+		t.Errorf("NArg() 期望 2，得到 %d", fs.NArg())
+	}
+}
