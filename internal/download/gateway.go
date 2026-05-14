@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -117,6 +118,39 @@ func (g *Gateway) FetchChunk(txID string, offset int64) ([]byte, error) {
 	})
 }
 
+// FetchRange 获取指定交易的指定字节范围数据
+// txID: 交易 ID
+// offset: 起始偏移量（字节，从 0 开始）
+// length: 读取长度（字节）
+func (g *Gateway) FetchRange(txID string, offset, length int64) ([]byte, error) {
+	path := fmt.Sprintf("/%s", txID)
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	return g.fetchWithHeaders(path, map[string]string{
+		"Range": rangeHeader,
+	})
+}
+
+// FetchToWriter 流式下载交易数据到 io.Writer，返回写入的字节数
+// 与 FetchTransaction 不同，此方法不将全部数据加载到内存，
+// 而是用 32KB 缓冲区流式拷贝到 writer（通常是 *os.File）。
+// 适用于大文件下载场景。
+func (g *Gateway) FetchToWriter(txID string, w io.Writer) (int64, error) {
+	path := fmt.Sprintf("/%s", txID)
+	return g.fetchToWriter(w, path, nil)
+}
+
+// FetchToFile 流式下载交易数据到本地文件
+// 返回写入的字节数。若文件已存在，会被覆盖。
+func (g *Gateway) FetchToFile(txID string, filePath string) (int64, error) {
+	f, err := os.Create(filePath)
+	if err != nil {
+		return 0, fmt.Errorf("创建文件 %s 失败: %w", filePath, err)
+	}
+	defer f.Close()
+
+	return g.FetchToWriter(txID, f)
+}
+
 // HeadTransaction 获取交易头信息（不下载完整数据）
 func (g *Gateway) HeadTransaction(txID string) (http.Header, error) {
 	path := fmt.Sprintf("/%s", txID)
@@ -181,7 +215,7 @@ func (g *Gateway) fetchWithHeaders(path string, headers map[string]string) ([]by
 			}
 
 			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
-				body, err := io.ReadAll(io.LimitReader(resp.Body, 200*1024*1024)) // 限制 200MB
+				body, err := io.ReadAll(resp.Body)
 				resp.Body.Close()
 				if err != nil {
 					lastErr = fmt.Errorf("读取响应失败: %w", err)
@@ -223,6 +257,89 @@ func (g *Gateway) fetchWithHeaders(path string, headers map[string]string) ([]by
 	}
 
 	return nil, fmt.Errorf("所有网关请求失败（%d 次尝试）: %w", g.config.MaxRetries, lastErr)
+}
+
+// fetchToWriter 流式 GET 请求，将响应体写入 io.Writer
+// 使用 32KB 缓冲区，内存占用可控。返回实际写入的字节数。
+func (g *Gateway) fetchToWriter(w io.Writer, path string, headers map[string]string) (int64, error) {
+	var lastErr error
+	buf := make([]byte, 32*1024) // 32KB 缓冲区
+
+	for attempt := 0; attempt < g.config.MaxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(g.config.RetryDelay)
+		}
+
+		for _, baseURL := range g.config.URLs {
+			url := strings.TrimRight(baseURL, "/") + path
+
+			req, err := http.NewRequest(http.MethodGet, url, nil)
+			if err != nil {
+				lastErr = fmt.Errorf("创建请求失败: %w", err)
+				continue
+			}
+
+			req.Header.Set("User-Agent", g.config.UserAgent)
+			req.Header.Set("Accept", "*/*")
+			for k, v := range headers {
+				req.Header.Set(k, v)
+			}
+
+			g.mu.Lock()
+			g.stats.TotalRequests++
+			g.mu.Unlock()
+
+			resp, err := g.client.Do(req)
+			if err != nil {
+				lastErr = fmt.Errorf("网关 %s 请求失败: %w", baseURL, err)
+				log.Debug("下载：网关请求失败: %v", err)
+				g.mu.Lock()
+				g.stats.TotalFailures++
+				g.mu.Unlock()
+				continue
+			}
+
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
+				written, err := io.CopyBuffer(w, resp.Body, buf)
+				resp.Body.Close()
+				if err != nil {
+					lastErr = fmt.Errorf("流式读取响应失败: %w", err)
+					g.mu.Lock()
+					g.stats.TotalFailures++
+					g.mu.Unlock()
+					continue
+				}
+
+				g.mu.Lock()
+				g.stats.TotalSuccess++
+				g.stats.BytesDownloaded += uint64(written)
+				g.mu.Unlock()
+
+				return written, nil
+			}
+
+			resp.Body.Close()
+
+			if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+				lastErr = fmt.Errorf("网关 %s 返回 %d (交易不存在)", baseURL, resp.StatusCode)
+				continue
+			}
+
+			if resp.StatusCode == http.StatusTooManyRequests {
+				log.Debug("下载：网关 %s 限流 (429)，等待重试", baseURL)
+				time.Sleep(time.Duration(attempt+1) * g.config.RetryDelay)
+				lastErr = fmt.Errorf("网关 %s 限流", baseURL)
+				continue
+			}
+
+			lastErr = fmt.Errorf("网关 %s 返回 HTTP %d", baseURL, resp.StatusCode)
+			g.mu.Lock()
+			g.stats.TotalFailures++
+			g.mu.Unlock()
+		}
+	}
+
+	return 0, fmt.Errorf("所有网关请求失败（%d 次尝试）: %w", g.config.MaxRetries, lastErr)
 }
 
 // head 执行 HTTP HEAD 请求
