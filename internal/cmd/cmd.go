@@ -73,21 +73,32 @@ func (c *Command) Execute(args []string) error {
 				subCmdName := args[1]
 				for _, subCmd := range cmd.Subcommands {
 					if subCmd.Name == subCmdName {
+						// 用于参数检查和执行的剩余参数
+						remainingArgs := args[2:]
+
 						if subCmd.FlagSet != nil {
-							subCmd.FlagSet.ParseArgs(args[2:])
+							err := subCmd.FlagSet.ParseArgs(args[2:])
+							if err != nil {
+								if err == flags.ErrHelpShown {
+									return nil
+								}
+								return err
+							}
+							// 使用 flag 解析后的剩余参数
+							remainingArgs = subCmd.FlagSet.Args()
 						}
 
-						// 检查参数数量
-						if subCmd.Args == 0 && len(args) > 2 {
+						// 检查参数数量（使用剩余参数）
+						if subCmd.Args == 0 && len(remainingArgs) > 0 {
 							return fmt.Errorf("命令 %s %s 不接受参数", cmd.Name, subCmd.Name)
 						}
-						if subCmd.Args > 0 && len(args)-2 != subCmd.Args {
+						if subCmd.Args > 0 && len(remainingArgs) != subCmd.Args {
 							return fmt.Errorf("命令 %s %s 需要 %d 个参数", cmd.Name, subCmd.Name, subCmd.Args)
 						}
 
 						// 执行子命令
 						if subCmd.Run != nil {
-							return subCmd.Run(args[2:])
+							return subCmd.Run(remainingArgs)
 						}
 						return nil
 					}
@@ -99,23 +110,30 @@ func (c *Command) Execute(args []string) error {
 			}
 
 			// 没有子命令或没有提供子命令，执行当前命令
+			remainingArgs := args[1:]
+
 			if cmd.FlagSet != nil {
-				cmd.FlagSet.ParseArgs(args[1:])
+				err := cmd.FlagSet.ParseArgs(args[1:])
+				if err != nil {
+					if err == flags.ErrHelpShown {
+						return nil
+					}
+					return err
+				}
+				remainingArgs = cmd.FlagSet.Args()
 			}
 
-			// 检查参数数量（有 FlagSet 的命令跳过参数数量检查，因为 flag 参数是合法的）
-			if cmd.FlagSet == nil {
-				if cmd.Args == 0 && len(args) > 1 {
-					return fmt.Errorf("命令 %s 不接受参数", cmd.Name)
-				}
-				if cmd.Args > 0 && len(args)-1 != cmd.Args {
-					return fmt.Errorf("命令 %s 需要 %d 个参数", cmd.Name, cmd.Args)
-				}
+			// 检查参数数量（使用剩余参数）
+			if cmd.Args == 0 && len(remainingArgs) > 0 {
+				return fmt.Errorf("命令 %s 不接受参数", cmd.Name)
+			}
+			if cmd.Args > 0 && len(remainingArgs) != cmd.Args {
+				return fmt.Errorf("命令 %s 需要 %d 个参数", cmd.Name, cmd.Args)
 			}
 
 			// 执行命令
 			if cmd.Run != nil {
-				return cmd.Run(args[1:])
+				return cmd.Run(remainingArgs)
 			}
 			return nil
 		}
@@ -253,7 +271,20 @@ func RegisterCommands() {
 		Usage: "[选项]",
 		Run: func(args []string) error {
 			fmt.Println("初始化配置...")
+
+			// 使用 config.Load 生成默认配置文件
+			cfg, err := config.Load("config.json")
+			if err != nil {
+				return fmt.Errorf("生成配置文件失败: %w", err)
+			}
+
 			fmt.Println("配置文件已生成：config.json")
+			fmt.Printf("  语言：%s\n", cfg.Language)
+			fmt.Printf("  日志级别：%s\n", cfg.LogLevel)
+			if cfg.LogFile != "" {
+				fmt.Printf("  日志文件：%s\n", cfg.LogFile)
+			}
+			fmt.Printf("  日志格式：%s\n", cfg.LogFormat)
 			return nil
 		},
 	})
@@ -283,6 +314,9 @@ func RegisterCommands() {
 		FlagSet: serveFlagSet,
 		Run: func(args []string) error {
 			configFile := serveFlagSet.GetString("config")
+			if configFile == "" {
+				configFile = "config.json"
+			}
 			port := serveFlagSet.GetInt("port")
 			verbose := serveFlagSet.GetBool("verbose")
 			preset := serveFlagSet.GetString("preset")

@@ -1,11 +1,15 @@
 package flags
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
 )
+
+// ErrHelpShown 表示已显示帮助信息，调用者应停止执行
+var ErrHelpShown = errors.New("help shown")
 
 // Flag 定义单个命令行参数
 type Flag struct {
@@ -117,15 +121,11 @@ func (fs *FlagSet) Parse() error {
 
 // ParseArgs 从指定参数列表解析
 func (fs *FlagSet) ParseArgs(args []string) error {
-	if len(args) == 0 {
-		fs.ShowHelp()
-		return nil
-	}
-
+	// 检查 --help / -h 标志（在任何解析之前）
 	for _, arg := range args {
 		if arg == "-h" || arg == "--help" || arg == "-help" {
 			fs.ShowHelp()
-			return nil
+			return ErrHelpShown
 		}
 	}
 
@@ -187,6 +187,16 @@ func (fs *FlagSet) GetInt(name string) int {
 	var result int
 	fmt.Sscanf(f.Value.String(), "%d", &result)
 	return result
+}
+
+// Args 返回解析后剩余的非 flag 参数
+func (fs *FlagSet) Args() []string {
+	return fs.flagSet.Args()
+}
+
+// NArg 返回解析后剩余的非 flag 参数数量
+func (fs *FlagSet) NArg() int {
+	return fs.flagSet.NArg()
 }
 
 // ShowHelp 显示帮助信息
