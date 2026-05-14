@@ -270,6 +270,10 @@ func RegisterCommands() {
 	serveFlagSet.DefineInt("online-sample", "", 5, "在线验证随机采样 block 数量")
 	serveFlagSet.DefineInt("online-concurrency", "", 4, "在线验证最大并发数")
 	serveFlagSet.DefineInt("download-concurrency", "", 2, "完整下载最大并发数")
+	serveFlagSet.DefineBool("dht", "", true, "启用 DHT 内容发布")
+	serveFlagSet.DefineString("dht-mode", "", "server", "DHT 模式：server 或 client", false)
+	serveFlagSet.DefineString("dht-reprovide", "", "12h", "DHT 重新提供间隔", false)
+	serveFlagSet.DefineInt("dht-concurrency", "", 4, "DHT 提供并发数")
 
 	RootCommand.AddCommand(&Command{
 		Name:    "serve",
@@ -288,6 +292,10 @@ func RegisterCommands() {
 			onlineSample := serveFlagSet.GetInt("online-sample")
 			onlineConcurrency := serveFlagSet.GetInt("online-concurrency")
 			downloadConcurrency := serveFlagSet.GetInt("download-concurrency")
+			dhtEnabled := serveFlagSet.GetBool("dht")
+			dhtMode := serveFlagSet.GetString("dht-mode")
+			dhtReprovide := serveFlagSet.GetString("dht-reprovide")
+			dhtConcurrency := serveFlagSet.GetInt("dht-concurrency")
 
 			if verbose {
 				config.ConfigFile.LogLevel = "debug"
@@ -302,6 +310,7 @@ func RegisterCommands() {
 			fmt.Printf("║ 安全预设:  %-20s ║\n", preset)
 			fmt.Printf("║ 网关地址:  %-20s ║\n", gateway)
 			fmt.Printf("║ 缓存目录:  %-20s ║\n", cacheDir)
+			fmt.Printf("║ DHT 发布:   %-20v ║\n", dhtEnabled)
 			fmt.Printf("╚══════════════════════════════════╝\n\n")
 
 			verifyPoW, verifyIndex, verifyRef, verifyIntegrity := config.ConfigFile.GetVerifyConfig()
@@ -322,6 +331,10 @@ func RegisterCommands() {
 				OnlineSampleCount:      onlineSample,
 				OnlineMaxConcurrency:   onlineConcurrency,
 				DownloadMaxConcurrency: downloadConcurrency,
+				DHTEnabled:             dhtEnabled,
+				DHTMode:                dhtMode,
+				DHTReprovideInterval:   dhtReprovide,
+				DHTProvideConcurrency:  dhtConcurrency,
 			}
 			if gateway != "" {
 				svcCfg.GatewayURLs = []string{gateway}
