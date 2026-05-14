@@ -4,8 +4,10 @@
 package download
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/lwdjd/IPFAR/internal/log"
+	"golang.org/x/net/proxy"
 )
 
 // GatewayConfig Arweave 网关配置
@@ -27,6 +30,9 @@ type GatewayConfig struct {
 	RetryDelay time.Duration
 	// UserAgent 自定义 User-Agent
 	UserAgent string
+	// Socks5Proxy SOCKS5 代理地址，如 "127.0.0.1:10808"
+	// 为空则不使用代理。会自动读取 SOCKS5_PROXY/socks5_proxy 环境变量
+	Socks5Proxy string
 }
 
 // DefaultGatewayConfig 返回默认网关配置
@@ -77,10 +83,38 @@ func NewGateway(config GatewayConfig) *Gateway {
 		config.RetryDelay = 1 * time.Second
 	}
 
+	// 如果未显式设置代理，从环境变量读取
+	if config.Socks5Proxy == "" {
+		for _, env := range []string{"SOCKS5_PROXY", "socks5_proxy", "all_proxy", "ALL_PROXY"} {
+			if v := os.Getenv(env); v != "" {
+				config.Socks5Proxy = v
+				break
+			}
+		}
+	}
+
 	transport := &http.Transport{
 		MaxIdleConns:        10,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
+	}
+
+	// 配置 SOCKS5 代理
+	if config.Socks5Proxy != "" {
+		proxyAddr := config.Socks5Proxy
+		// 去除 socks5:// 前缀（如果有）
+		proxyAddr = strings.TrimPrefix(proxyAddr, "socks5://")
+		proxyAddr = strings.TrimPrefix(proxyAddr, "socks5h://")
+
+		dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+		if err != nil {
+			log.Warn("SOCKS5 代理配置失败 (%s): %v，将直连", proxyAddr, err)
+		} else {
+			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			}
+			log.Info("已配置 SOCKS5 代理: %s", proxyAddr)
+		}
 	}
 
 	return &Gateway{
@@ -99,11 +133,23 @@ func (g *Gateway) FetchTransaction(txID string) ([]byte, error) {
 	return g.fetch(path)
 }
 
-// FetchTransactionData 获取交易关联的数据（从 data 端点）
+// FetchTransactionData 获取交易关联的数据（从 /raw 端点）
 // txID: Arweave 交易 ID
 func (g *Gateway) FetchTransactionData(txID string) ([]byte, error) {
-	path := fmt.Sprintf("/%s", txID)
-	// Arweave 网关对非浏览器请求直接返回原始数据
+	// 优先使用 /raw 端点，避免裸端点返回 570 等问题
+	path := fmt.Sprintf("/raw/%s", txID)
+	data, err := g.fetch(path)
+	if err != nil {
+		// 回退到裸端点（某些网关可能不支持 /raw）
+		path = fmt.Sprintf("/%s", txID)
+		return g.fetch(path)
+	}
+	return data, nil
+}
+
+// FetchRaw 从 /raw 端点获取原始数据（不经过网关的内容类型协商）
+func (g *Gateway) FetchRaw(txID string) ([]byte, error) {
+	path := fmt.Sprintf("/raw/%s", txID)
 	return g.fetch(path)
 }
 

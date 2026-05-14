@@ -5,6 +5,7 @@ go 1.25.7
 require (
 	github.com/LWDJD/ipfar-sdk v0.0.0-20260513012356-0731f65950da
 	github.com/Xuanwo/go-locale v1.1.3
+	github.com/dgraph-io/badger/v4 v4.9.1
 	github.com/ipfs/go-cid v0.6.1
 	github.com/leonelquinteros/gotext v1.7.2
 	github.com/libp2p/go-libp2p v0.48.0
@@ -12,6 +13,7 @@ require (
 	github.com/multiformats/go-multicodec v0.10.0
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/multiformats/go-varint v0.1.0
+	golang.org/x/net v0.52.0
 	golang.org/x/text v0.36.0
 )
 
@@ -24,7 +26,6 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/davidlazar/go-crypto v0.0.0-20200604182044-b73af7476f6c // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1 // indirect
-	github.com/dgraph-io/badger/v4 v4.9.1 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.2.0 // indirect
 	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -110,7 +111,6 @@ require (
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
-	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
