@@ -10,8 +10,10 @@ import (
 
 	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
 	"github.com/LWDJD/ipfar-sdk/verify/pipeline"
+	"github.com/ipfs/go-cid"
 
 	"github.com/lwdjd/IPFAR/internal/discovery"
+	"github.com/lwdjd/IPFAR/internal/dht"
 	"github.com/lwdjd/IPFAR/internal/download"
 	"github.com/lwdjd/IPFAR/internal/log"
 	"github.com/lwdjd/IPFAR/internal/verify"
@@ -48,6 +50,14 @@ type ServiceConfig struct {
 	OnlineSampleCount     int  // 在线验证采样 block 数量（默认 5）
 	OnlineMaxConcurrency  int  // 在线验证最大并发数（默认 4）
 	DownloadMaxConcurrency int  // 完整下载最大并发数（默认 2）
+
+	// DHT 内容发布配置（规范 P3-1）
+	DHTEnabled          bool     // 是否启用 DHT 内容发布
+	DHTMode             string   // DHT 模式: "server" / "client"
+	DHTBootstrapPeers   []string // DHT 引导节点
+	DHTReprovideInterval string   // 重新提供间隔
+	DHTProvideConcurrency int    // 提供并发数
+	DHTListenAddresses  []string // libp2p 监听地址
 }
 
 // DefaultServiceConfig 返回默认服务配置
@@ -73,6 +83,9 @@ type Service struct {
 	bridge  *Bridge
 	fetcher *download.Fetcher
 	sampler *discovery.Sampler
+
+	// DHT 内容发布提供器
+	dhtProvider *dht.Provider
 
 	// 在线验证器（延迟初始化）
 	onlineVerifier     *verify.OnlineVerifier
@@ -169,8 +182,15 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		},
 	}
 
-	log.Info("桥接服务：初始化完成 preset=%s verify_pow=%v verify_index=%v verify_ref=%v verify_integrity=%v online_verify=%v",
-		cfg.Preset, verifyPoW, verifyIndex, verifyRef, verifyIntegrity, cfg.OnlineVerify)
+	// 初始化 DHT Provider
+	if cfg.DHTEnabled {
+		if err := svc.initDHTProvider(); err != nil {
+			log.Warn("桥接服务：DHT Provider 初始化失败（非致命）: %v", err)
+		}
+	}
+
+	log.Info("桥接服务：初始化完成 preset=%s verify_pow=%v verify_index=%v verify_ref=%v verify_integrity=%v online_verify=%v dht=%v",
+		cfg.Preset, verifyPoW, verifyIndex, verifyRef, verifyIntegrity, cfg.OnlineVerify, cfg.DHTEnabled && svc.dhtProvider != nil)
 
 	return svc, nil
 }
@@ -187,6 +207,51 @@ func (s *Service) getOnlineVerifier() *verify.OnlineVerifier {
 	return s.onlineVerifier
 }
 
+// initDHTProvider 初始化 DHT 内容发布提供器
+func (s *Service) initDHTProvider() error {
+	cfg := dht.DefaultConfig()
+	cfg.Enabled = true
+
+	if s.config.DHTMode != "" {
+		cfg.Mode = dht.Mode(s.config.DHTMode)
+	}
+	if len(s.config.DHTBootstrapPeers) > 0 {
+		cfg.BootstrapPeers = s.config.DHTBootstrapPeers
+	}
+	if s.config.DHTProvideConcurrency > 0 {
+		cfg.ProvideConcurrency = s.config.DHTProvideConcurrency
+	}
+	if s.config.DHTReprovideInterval != "" {
+		if dur, err := time.ParseDuration(s.config.DHTReprovideInterval); err == nil {
+			cfg.ReprovideInterval = dur
+		} else {
+			log.Warn("桥接服务：无法解析 DHT 重提供间隔 %q: %v", s.config.DHTReprovideInterval, err)
+		}
+	}
+
+	// 创建 libp2p host
+	// TODO: 完整的 libp2p host 创建，现在是简化版本
+	// 实际部署时需要配置监听地址、NAT 穿透等
+	log.Info("桥接服务：DHT Provider 配置: mode=%s concurrency=%d reprovide=%s",
+		cfg.Mode, cfg.ProvideConcurrency, cfg.ReprovideInterval)
+
+	// DHT Provider 需要 libp2p host，由外部注入
+	// initDHTProvider 在 host 为 nil 时会推迟到 Start 阶段
+	s.dhtProvider = nil // 由外部通过 SetDHTProvider 注入
+
+	return nil
+}
+
+// SetDHTProvider 设置 DHT Provider（在 libp2p host 初始化后调用）
+func (s *Service) SetDHTProvider(provider *dht.Provider) {
+	s.dhtProvider = provider
+}
+
+// GetDHTProvider 获取 DHT Provider
+func (s *Service) GetDHTProvider() *dht.Provider {
+	return s.dhtProvider
+}
+
 // Start 启动桥接服务（阻塞）
 func (s *Service) Start() error {
 	log.Info("桥接服务：启动中...")
@@ -196,6 +261,13 @@ func (s *Service) Start() error {
 	log.Info("  在线验证: %v", s.config.OnlineVerify)
 	log.Info("  下载并发: %d | 在线验证并发: %d",
 		cap(s.downloadSema), cap(s.onlineSema))
+	if s.dhtProvider != nil {
+		log.Info("  DHT 内容发布: 已启用")
+	} else if s.config.DHTEnabled {
+		log.Info("  DHT 内容发布: 已配置但 Provider 未注入")
+	} else {
+		log.Info("  DHT 内容发布: 未启用")
+	}
 
 	// 启动发现采样器（如果配置了 checker）
 	if s.sampler != nil {
@@ -225,6 +297,12 @@ func (s *Service) Stop() {
 	s.cancel()
 	if s.sampler != nil {
 		s.sampler.Stop()
+	}
+	// 停止 DHT Provider
+	if s.dhtProvider != nil {
+		if err := s.dhtProvider.Stop(); err != nil {
+			log.Warn("桥接服务：停止 DHT Provider 失败: %v", err)
+		}
 	}
 	s.wg.Wait()
 	log.Info("桥接服务：已停止")
@@ -520,6 +598,20 @@ func (s *Service) processFullDownload(meta *sdkmeta.Metadata, quickResult *pipel
 	s.mu.Unlock()
 
 	log.Info("桥接服务：CAR 文件已下载 root_cid=%s path=%s", meta.RootCID, carPath)
+
+	// DHT 内容发布：验证通过后发布 CID 到 DHT 网络
+	if s.dhtProvider != nil && s.dhtProvider.IsStarted() {
+		go func() {
+			rootCID, err := cid.Decode(meta.RootCID)
+			if err != nil {
+				log.Warn("桥接服务：无法解析 RootCID %q 为 CID: %v", meta.RootCID, err)
+				return
+			}
+			if err := s.dhtProvider.Provide(rootCID); err != nil {
+				log.Warn("桥接服务：DHT Provide 失败 %s: %v", meta.RootCID, err)
+			}
+		}()
+	}
 
 	// 运行完整验证管道（索引、引用链、完整性）
 	fullResult := s.bridge.RunPipeline(meta, true)

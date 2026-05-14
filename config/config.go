@@ -21,6 +21,27 @@ type Config struct {
 
 	// 安全等级预设（如果设置，将覆盖上述单独选项）
 	SecurityPreset string `json:"security_preset,omitempty"` // strict, balanced, light, trusted
+
+	// DHT 内容发布配置（规范 P3-1）
+	DHT DHTConfig `json:"dht,omitempty"`
+}
+
+// DHTConfig DHT 内容发布配置
+type DHTConfig struct {
+	// Enabled 是否启用 DHT 内容发布
+	Enabled bool `json:"enabled,omitempty"`
+	// Mode DHT 运行模式: "server" 或 "client"
+	Mode string `json:"mode,omitempty"`
+	// BootstrapPeers 引导节点地址列表
+	BootstrapPeers []string `json:"bootstrap_peers,omitempty"`
+	// ReprovideInterval 重新提供间隔（字符串格式，如 "12h"）
+	ReprovideInterval string `json:"reprovide_interval,omitempty"`
+	// ProvideConcurrency 提供并发数
+	ProvideConcurrency int `json:"provide_concurrency,omitempty"`
+	// RetryMaxAttempts 最大重试次数
+	RetryMaxAttempts int `json:"retry_max_attempts,omitempty"`
+	// ListenAddresses libp2p 监听地址
+	ListenAddresses []string `json:"listen_addresses,omitempty"`
 }
 
 // ConfigFile 全局配置文件实例
