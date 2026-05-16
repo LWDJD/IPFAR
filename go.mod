@@ -121,3 +121,5 @@ require (
 )
 
 replace github.com/libp2p/go-libp2p-kad-dht => /AstrBot/data/kad-dht-repo/go-libp2p-kad-dht
+
+replace github.com/LWDJD/ipfar-sdk => /AstrBot/data/workspaces/QQbot_FriendMessage_6E6F7FCAC8E243D639009B3DDF7DFE39/ipfar-sdk

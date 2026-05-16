@@ -63,6 +63,8 @@ func validateConfig(cfg Config) Config {
 type ResolveResult struct {
 	// ReferencedTXIDs 所有被引用的 TXID 列表（含主 TXID）
 	ReferencedTXIDs []string `json:"referenced_txids"`
+	// ReferenceEntries 引用条目映射（txid → entry），用于 bundle_txid 查找
+	ReferenceEntries map[string]sdkmeta.ReferenceEntry `json:"-"`
 	// CARFiles 所有下载的 CAR 文件路径（主 CAR + 引用 CAR）
 	CARFiles map[string]string `json:"car_files"` // txid → filepath
 	// Visited 已访问的 TXID 集合
@@ -139,11 +141,12 @@ func (r *Resolver) Resolve(ctx context.Context, meta *sdkmeta.Metadata) (*Resolv
 	defer cancel()
 
 	result := &ResolveResult{
-		CARFiles: make(map[string]string),
-		Visited:  make(map[string]bool),
+		CARFiles:         make(map[string]string),
+		Visited:          make(map[string]bool),
+		ReferenceEntries: make(map[string]sdkmeta.ReferenceEntry),
 	}
 
-	// 从主 DataTXID 开始
+	// 从主 MetaData 提取引用
 	rootTXID := meta.DataTXID
 
 	log.Info("引用链：开始解析 root_txid=%s max_depth=%d timeout=%v",
@@ -159,6 +162,12 @@ func (r *Resolver) Resolve(ctx context.Context, meta *sdkmeta.Metadata) (*Resolv
 		return result, nil
 	}
 
+	// 缓存引用条目
+	refMap := *meta.Reference
+	for refTXID, entry := range refMap {
+		result.ReferenceEntries[refTXID] = entry
+	}
+
 	// BFS 队列（从引用的 TXID 开始）
 	type queueItem struct {
 		txID  string
@@ -166,7 +175,6 @@ func (r *Resolver) Resolve(ctx context.Context, meta *sdkmeta.Metadata) (*Resolv
 	}
 
 	queue := make([]queueItem, 0)
-	refMap := *meta.Reference
 	for refTXID := range refMap {
 		if !r.isVisited(refTXID, result.Visited) {
 			r.markVisited(refTXID, result.Visited)
@@ -209,8 +217,14 @@ func (r *Resolver) Resolve(ctx context.Context, meta *sdkmeta.Metadata) (*Resolv
 
 		// 如果缓存未命中，通过网关下载
 		if refMeta == nil {
+			// 检查是否有 bundle_txid 用于此引用
+			var bundleTXID string
+			if entry, ok := result.ReferenceEntries[item.txID]; ok {
+				bundleTXID = entry.BundleTXID
+			}
+
 			var err error
-			refMeta, err = r.fetchMetadata(ctx, item.txID)
+			refMeta, err = r.fetchMetadataWithBundle(ctx, item.txID, bundleTXID)
 			if err != nil {
 				log.Warn("引用链：下载元数据失败 %s: %v", item.txID, err)
 				result.Errors = append(result.Errors,
@@ -232,6 +246,11 @@ func (r *Resolver) Resolve(ctx context.Context, meta *sdkmeta.Metadata) (*Resolv
 		}
 
 		nestedRef := *refMeta.Reference
+
+		// 缓存嵌套引用条目
+		for refTXID, entry := range nestedRef {
+			result.ReferenceEntries[refTXID] = entry
+		}
 
 		// 将嵌套引用中的 TXID 加入队列
 		for refTXID := range nestedRef {
@@ -260,6 +279,7 @@ func (r *Resolver) Resolve(ctx context.Context, meta *sdkmeta.Metadata) (*Resolv
 // DownloadReferencedCARs 下载引用链中所有 CAR 文件
 //
 // 在 Resolve 之后调用，下载所有被引用的 CAR 文件到本地。
+// 支持引用中的 bundle_txid 字段。
 func (r *Resolver) DownloadReferencedCARs(ctx context.Context, result *ResolveResult, fetcher *download.Fetcher) (map[string]string, error) {
 	if result == nil {
 		return nil, fmt.Errorf("result is nil")
@@ -272,6 +292,9 @@ func (r *Resolver) DownloadReferencedCARs(ctx context.Context, result *ResolveRe
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(result.ReferencedTXIDs))
+
+	// 获取引用条目信息（用于 bundle_txid）
+	refEntries := result.ReferenceEntries
 
 	for _, txID := range result.ReferencedTXIDs {
 		// 跳过主 TXID（已由调用者下载）
@@ -290,16 +313,30 @@ func (r *Resolver) DownloadReferencedCARs(ctx context.Context, result *ResolveRe
 			default:
 			}
 
-			// 通过网关下载 CAR 文件
 			gateway := fetcher.GetGateway()
 			if gateway == nil {
 				gateway = download.NewGateway(download.DefaultGatewayConfig())
 			}
 
-			data, err := gateway.FetchTransactionData(txID)
-			if err != nil {
-				errCh <- fmt.Errorf("download CAR %s: %w", txID, err)
-				return
+			// 检查是否有 bundle_txid 用于此引用
+			var data []byte
+			var err error
+
+			if entry, ok := refEntries[txID]; ok && entry.BundleTXID != "" && entry.BundleTXID != "none" && entry.Height == -1 {
+				// 跨 Bundle 引用
+				_, rawData, fetchErr := gateway.FetchBundleItemByID(entry.BundleTXID, txID)
+				if fetchErr != nil {
+					errCh <- fmt.Errorf("download bundle ref CAR %s (bundle=%s): %w", txID, entry.BundleTXID, fetchErr)
+					return
+				}
+				data = rawData
+			} else {
+				// 普通模式
+				data, err = gateway.FetchTransactionData(txID)
+				if err != nil {
+					errCh <- fmt.Errorf("download CAR %s: %w", txID, err)
+					return
+				}
 			}
 
 			// 保存到缓存
@@ -419,6 +456,11 @@ func (r *Resolver) cacheDir() string {
 
 // fetchMetadata 通过网关获取并解析元数据
 func (r *Resolver) fetchMetadata(ctx context.Context, txID string) (*sdkmeta.Metadata, error) {
+	return r.fetchMetadataWithBundle(ctx, txID, "")
+}
+
+// fetchMetadataWithBundle 通过网关获取并解析元数据，支持 bundle_txid
+func (r *Resolver) fetchMetadataWithBundle(ctx context.Context, txID, bundleTXID string) (*sdkmeta.Metadata, error) {
 	var gateway *download.Gateway
 	if r.config.Gateway != nil {
 		gateway = r.config.Gateway
@@ -426,9 +468,22 @@ func (r *Resolver) fetchMetadata(ctx context.Context, txID string) (*sdkmeta.Met
 		gateway = download.NewGateway(download.DefaultGatewayConfig())
 	}
 
-	data, err := gateway.FetchTransaction(txID)
-	if err != nil {
-		return nil, fmt.Errorf("fetch tx %s: %w", txID, err)
+	var data []byte
+	var err error
+
+	if bundleTXID != "" && bundleTXID != "none" {
+		// 跨 Bundle 引用：从 bundle 中获取元数据 item
+		_, rawData, fetchErr := gateway.FetchBundleItemByID(bundleTXID, txID)
+		if fetchErr != nil {
+			return nil, fmt.Errorf("fetch bundle item %s from bundle %s: %w", txID, bundleTXID, fetchErr)
+		}
+		data = rawData
+	} else {
+		// 普通模式：直接获取交易数据
+		data, err = gateway.FetchTransaction(txID)
+		if err != nil {
+			return nil, fmt.Errorf("fetch tx %s: %w", txID, err)
+		}
 	}
 
 	meta, err := sdkmeta.ParseAndValidate(data)
