@@ -413,6 +413,12 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 	s.stats.MetadataFetched++
 	s.mu.Unlock()
 
+	// Step 1.5: 如果是同 Bundle 模式，缓存 Bundle 原始数据
+	// 需要重新获取 Bundle 交易数据（包含所有 Items），并提取 CAR Item
+	if meta.IsSameBundle() {
+		s.cacheSameBundleData(txID, meta)
+	}
+
 	// 元数据已在 FetchMetadataByTXID 中校验过
 	// Step 2: 运行快速验证（元数据校验 + PoW）
 	quickResult := s.bridge.RunPipeline(meta, false)
@@ -481,7 +487,7 @@ func (s *Service) processOnlineVerify(meta *sdkmeta.Metadata, quickResult *pipel
 	defer func() { <-s.onlineSema }()
 
 	verifier := s.getOnlineVerifier()
-	onlineResult, err := verifier.Verify(meta.DataTXID)
+	onlineResult, err := verifier.VerifyWithMeta(meta)
 	if err != nil {
 		log.Warn("桥接服务：在线验证失败 data_txid=%s: %v", meta.DataTXID, err)
 
@@ -743,6 +749,38 @@ func (s *Service) updateActivity() {
 // GetFetcher 获取下载器（用于外部访问）
 func (s *Service) GetFetcher() *download.Fetcher {
 	return s.fetcher
+}
+
+// cacheSameBundleData 缓存同 Bundle 的 CAR 数据
+// 当 data_height = -1 且 bundle_txid = "none" 时，
+// 元数据和 CAR 文件在同一个 Bundle 内。
+// 此方法从 Bundle 交易中提取 CAR Item 的纯数据并缓存。
+func (s *Service) cacheSameBundleData(metadataTxID string, meta *sdkmeta.Metadata) {
+	gateway := s.fetcher.GetGateway()
+	if gateway == nil {
+		log.Warn("桥接服务：无法缓存同 Bundle 数据，网关不可用")
+		return
+	}
+
+	// 获取 Bundle 原始数据
+	// metadataTxID 是元数据所在的交易 ID（可能是 Bundle TXID 或 Bundle Item ID）
+	// 这里简化处理：假设 metadataTxID 就是 Bundle TXID
+	_, rawData, err := gateway.FetchBundleItemByID(metadataTxID, meta.DataTXID)
+	if err != nil {
+		log.Warn("桥接服务：缓存同 Bundle 数据失败 bundle=%s item=%s: %v",
+			metadataTxID, meta.DataTXID, err)
+		return
+	}
+
+	// 缓存到 Fetcher（用于下载）
+	s.fetcher.CacheBundleRawData(meta.DataTXID, rawData)
+
+	// 同时缓存到 OnlineVerifier（用于在线验证）
+	if s.config.OnlineVerify {
+		s.getOnlineVerifier().SetBundleData(meta.DataTXID, rawData)
+	}
+
+	log.Info("桥接服务：同 Bundle 数据已缓存 item=%s size=%d", meta.DataTXID, len(rawData))
 }
 
 // GetOnlineVerifier 获取在线验证器

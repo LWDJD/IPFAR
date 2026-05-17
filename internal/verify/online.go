@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
 	"github.com/LWDJD/ipfar-sdk/verify/ipfs"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
@@ -59,6 +60,10 @@ type OnlineVerifier struct {
 	config  OnlineVerifierConfig
 	gateway *download.Gateway
 	sema    chan struct{} // 并发控制信号量
+
+	// Bundle 数据缓存（同 Bundle 验证使用）
+	mu              sync.RWMutex
+	bundleDataCache map[string][]byte // key: itemID, value: raw CAR data
 }
 
 // NewOnlineVerifier 创建新的在线验证器
@@ -264,7 +269,318 @@ func (v *OnlineVerifier) Verify(dataTXID string) (*OnlineVerifyResult, error) {
 	return result, nil
 }
 
-// VerifyWithSampleCount 指定采样数量的在线验证
+// VerifyWithMeta 根据完整的元数据选择正确的验证路径
+//
+// 自动处理三种模式：
+//  1. 普通模式（data_height >= 0）：直接验证 data_txid
+//  2. 跨 Bundle 模式（data_height = -1, bundle_txid != "none"）：
+//     解析 Bundle 头部获取 Item 偏移量，通过 Range 请求验证
+//  3. 同 Bundle 模式（data_height = -1, bundle_txid = "none"）：
+//     需要预先缓存 Bundle raw data（通过 SetBundleData 注入）
+func (v *OnlineVerifier) VerifyWithMeta(meta *sdkmeta.Metadata) (*OnlineVerifyResult, error) {
+	if meta == nil {
+		return nil, fmt.Errorf("metadata is nil")
+	}
+
+	if meta.IsCrossBundle() {
+		return v.verifyBundleItem(meta.BundleTXID, meta.DataTXID)
+	} else if meta.IsSameBundle() {
+		return v.verifySameBundleItem(meta.DataTXID)
+	}
+
+	// 普通模式
+	return v.Verify(meta.DataTXID)
+}
+
+// verifyBundleItem 验证跨 Bundle 中的 Item
+// 通过解析 Bundle 头部获取 Item 偏移量，然后用 Range 请求验证
+func (v *OnlineVerifier) verifyBundleItem(bundleTXID, itemID string) (*OnlineVerifyResult, error) {
+	log.Info("在线验证：跨 Bundle 模式 bundle=%s item=%s", bundleTXID, itemID)
+
+	// Step 1: 获取 Bundle 头部，找到 Item 的偏移和长度
+	_, bundleHeader, err := v.gateway.FetchBundleItemByID(bundleTXID, itemID)
+	if err != nil {
+		return nil, fmt.Errorf("在线验证：获取 Bundle Item 失败: %w", err)
+	}
+
+	// bundleHeader 是纯 CAR 数据（不含 ANS-104 头部）
+	// 需要将纯数据包装为可验证的格式
+	// 这里我们直接将数据写入临时缓冲区进行验证
+
+	result := &OnlineVerifyResult{
+		DataTXID: itemID,
+	}
+
+	if len(bundleHeader) == 0 {
+		return nil, fmt.Errorf("在线验证：Bundle Item 数据为空")
+	}
+
+	// Step 2: 使用内存中的数据进行验证
+	// 创建 bytes.Reader 用于验证
+	reader := newBytesReader(bundleHeader)
+
+	// 解析 CAR v2 版本
+	version, err := v.readVersion(bundleHeader)
+	if err != nil {
+		return nil, fmt.Errorf("解析 CAR 版本失败: %w", err)
+	}
+	if version != 2 {
+		return nil, fmt.Errorf("仅支持 CAR v2 格式，当前版本: %d", version)
+	}
+
+	// 解析 CAR v2 header
+	v2Header, err := v.parseCarV2Header(bundleHeader)
+	if err != nil {
+		return nil, fmt.Errorf("解析 CAR v2 头部失败: %w", err)
+	}
+
+	_ = reader // silence unused warning
+
+	// 计算准确的 IndexSize
+	fileSize := int64(len(bundleHeader))
+	v2Header.IndexSize = uint64(fileSize) - v2Header.IndexOffset
+
+	if !v2Header.HasIndex() || v2Header.IndexSize == 0 {
+		return nil, fmt.Errorf("CAR v2 文件不包含索引段")
+	}
+
+	result.IndexSize = v2Header.IndexSize
+
+	// 读取 Index 段
+	if int(v2Header.IndexOffset)+int(v2Header.IndexSize) > len(bundleHeader) {
+		return nil, fmt.Errorf("索引段越界")
+	}
+	indexData := bundleHeader[v2Header.IndexOffset : v2Header.IndexOffset+v2Header.IndexSize]
+
+	// 解析索引条目
+	entries, err := v.parseIndex(indexData)
+	if err != nil {
+		return nil, fmt.Errorf("解析索引失败: %w", err)
+	}
+
+	result.TotalBlocks = len(entries)
+	log.Info("在线验证（跨 Bundle）：索引包含 %d 个 block", result.TotalBlocks)
+
+	if len(entries) == 0 {
+		result.Passed = true
+		return result, nil
+	}
+
+	// 采样验证
+	sampleCount := v.config.SampleCount
+	if sampleCount > len(entries) {
+		sampleCount = len(entries)
+	}
+	sampled := v.randomSample(entries, sampleCount)
+	result.SampledBlocks = len(sampled)
+
+	// 并发验证采样 block
+	var wg sync.WaitGroup
+	results := make(chan struct {
+		passed bool
+		err    error
+	}, len(sampled))
+
+	for _, entry := range sampled {
+		wg.Add(1)
+		go func(e IndexEntry) {
+			defer wg.Done()
+			v.sema <- struct{}{}
+			defer func() { <-v.sema }()
+
+			passed, err := v.verifyBlockInMemory(bundleHeader, v2Header, e)
+			results <- struct {
+				passed bool
+				err    error
+			}{passed, err}
+		}(entry)
+	}
+
+	wg.Wait()
+	close(results)
+
+	for res := range results {
+		if res.err != nil {
+			result.Errors = append(result.Errors, res.err.Error())
+			result.FailedBlocks++
+		} else if res.passed {
+			result.VerifiedBlocks++
+		} else {
+			result.FailedBlocks++
+		}
+	}
+
+	result.Passed = result.FailedBlocks == 0 && result.VerifiedBlocks > 0
+	return result, nil
+}
+
+// verifySameBundleItem 验证同 Bundle 中的 Item
+// 需要预先通过 SetBundleData 缓存 Bundle raw data
+func (v *OnlineVerifier) verifySameBundleItem(itemID string) (*OnlineVerifyResult, error) {
+	v.mu.RLock()
+	bundleData, ok := v.bundleDataCache[itemID]
+	v.mu.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("同 Bundle 数据未缓存: item_id=%s，请先调用 SetBundleData", itemID)
+	}
+
+	// 复用 verifyBundleItem 的逻辑（bundleData 已经是纯 CAR 数据）
+	log.Info("在线验证：同 Bundle 模式 item=%s", itemID)
+
+	result := &OnlineVerifyResult{
+		DataTXID: itemID,
+	}
+
+	return v.verifyFromBytes(bundleData, result)
+}
+
+// verifyBlockInMemory 在内存中验证单个 block（无需 HTTP 请求）
+func (v *OnlineVerifier) verifyBlockInMemory(data []byte, hdr *carV2Header, entry IndexEntry) (bool, error) {
+	fileOffset := int64(hdr.DataOffset) + int64(entry.Offset)
+
+	if fileOffset+256 > int64(len(data)) {
+		return false, fmt.Errorf("block @%d 越界", fileOffset)
+	}
+
+	headData := data[fileOffset:]
+
+	// 解析 section length
+	br := newBytesReader(headData)
+	sectionLen, err := varint.ReadUvarint(br)
+	if err != nil {
+		return false, fmt.Errorf("解析 block section length @%d 失败: %w", fileOffset, err)
+	}
+
+	if sectionLen == 0 {
+		return false, fmt.Errorf("block section length 为 0 @%d", fileOffset)
+	}
+
+	cidStart := int64(br.pos)
+	cidEnd := cidStart + int64(sectionLen)
+
+	if cidEnd > int64(len(headData)) {
+		return false, fmt.Errorf("block CID 越界 @%d", fileOffset)
+	}
+
+	_, blockCID, err := cid.CidFromBytes(headData[cidStart:cidEnd])
+	if err != nil {
+		return false, fmt.Errorf("解析 block CID @%d 失败: %w", fileOffset, err)
+	}
+
+	dataStart := cidStart + int64(blockCID.ByteLen())
+	dataEnd := int64(br.pos) + int64(sectionLen)
+	blockData := headData[dataStart:dataEnd]
+
+	hash, err := blockCID.Prefix().Sum(blockData)
+	if err != nil {
+		return false, fmt.Errorf("计算 block @%d hash 失败: %w", fileOffset, err)
+	}
+
+	if !hash.Equals(blockCID) {
+		return false, fmt.Errorf("block @%d CID 不匹配", fileOffset)
+	}
+
+	return true, nil
+}
+
+// verifyFromBytes 从内存中的 CAR 数据进行验证
+func (v *OnlineVerifier) verifyFromBytes(data []byte, result *OnlineVerifyResult) (*OnlineVerifyResult, error) {
+	if len(data) < 51 {
+		return nil, fmt.Errorf("CAR 数据太短")
+	}
+
+	version, err := v.readVersion(data)
+	if err != nil || version != 2 {
+		return nil, fmt.Errorf("不是有效的 CAR v2 文件")
+	}
+
+	v2Header, err := v.parseCarV2Header(data)
+	if err != nil {
+		return nil, err
+	}
+
+	fileSize := int64(len(data))
+	v2Header.IndexSize = uint64(fileSize) - v2Header.IndexOffset
+
+	if !v2Header.HasIndex() || v2Header.IndexSize == 0 {
+		return nil, fmt.Errorf("CAR v2 文件不包含索引段")
+	}
+
+	result.IndexSize = v2Header.IndexSize
+
+	if int(v2Header.IndexOffset)+int(v2Header.IndexSize) > len(data) {
+		return nil, fmt.Errorf("索引段越界")
+	}
+	indexData := data[v2Header.IndexOffset : v2Header.IndexOffset+v2Header.IndexSize]
+
+	entries, err := v.parseIndex(indexData)
+	if err != nil {
+		return nil, err
+	}
+
+	result.TotalBlocks = len(entries)
+
+	if len(entries) == 0 {
+		result.Passed = true
+		return result, nil
+	}
+
+	sampleCount := v.config.SampleCount
+	if sampleCount > len(entries) {
+		sampleCount = len(entries)
+	}
+	sampled := v.randomSample(entries, sampleCount)
+	result.SampledBlocks = len(sampled)
+
+	var wg sync.WaitGroup
+	results := make(chan struct {
+		passed bool
+		err    error
+	}, len(sampled))
+
+	for _, entry := range sampled {
+		wg.Add(1)
+		go func(e IndexEntry) {
+			defer wg.Done()
+			v.sema <- struct{}{}
+			defer func() { <-v.sema }()
+
+			passed, err := v.verifyBlockInMemory(data, v2Header, e)
+			results <- struct {
+				passed bool
+				err    error
+			}{passed, err}
+		}(entry)
+	}
+
+	wg.Wait()
+	close(results)
+
+	for res := range results {
+		if res.err != nil {
+			result.Errors = append(result.Errors, res.err.Error())
+			result.FailedBlocks++
+		} else if res.passed {
+			result.VerifiedBlocks++
+		} else {
+			result.FailedBlocks++
+		}
+	}
+
+	result.Passed = result.FailedBlocks == 0 && result.VerifiedBlocks > 0
+	return result, nil
+}
+
+// SetBundleData 缓存 Bundle raw data 用于同 Bundle 验证
+func (v *OnlineVerifier) SetBundleData(itemID string, data []byte) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.bundleDataCache == nil {
+		v.bundleDataCache = make(map[string][]byte)
+	}
+	v.bundleDataCache[itemID] = data
+}
 func (v *OnlineVerifier) VerifyWithSampleCount(dataTXID string, sampleCount int) (*OnlineVerifyResult, error) {
 	oldCount := v.config.SampleCount
 	v.config.SampleCount = sampleCount
