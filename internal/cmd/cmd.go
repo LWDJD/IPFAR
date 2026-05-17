@@ -6,11 +6,13 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/lwdjd/IPFAR/config"
 	"github.com/lwdjd/IPFAR/internal/bridge"
 	"github.com/lwdjd/IPFAR/internal/flags"
 	"github.com/lwdjd/IPFAR/internal/log"
+	"github.com/lwdjd/IPFAR/internal/verify"
 	"github.com/lwdjd/IPFAR/internal/version"
 
 	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
@@ -600,6 +602,81 @@ func RegisterCommands() {
 
 			_ = tags
 			return verifyTagsFromJSON(args[0])
+		},
+	})
+
+	// verify full 子命令：全量验证
+	verifyFullFlagSet := flags.NewFlagSet("verify-full")
+	verifyFullFlagSet.DefineString("cache-dir", "", "cache/car", "CAR 文件缓存目录", false)
+	verifyFullFlagSet.DefineString("gateway", "", "https://arweave.net", "Arweave 网关 URL（用于重新获取元数据）", false)
+	verifyFullFlagSet.DefineInt("concurrency", "", 2, "最大并发验证数")
+	verifyFullFlagSet.DefineBool("no-skip", "", false, "元数据不可用时不跳过（标记为失败）")
+	verifyFullFlagSet.DefineBool("quiet", "q", false, "静默模式（仅输出汇总）")
+
+	verifyCmd.AddCommand(&Command{
+		Name:    "full",
+		Short:   "全量验证缓存中的所有 CAR 文件",
+		Long:    "遍历缓存中的所有 CAR 文件，重新执行完整的验证链（PoW → Index → ReferenceChain → Integrity）。" +
+			"在 strict 预设基础上对已缓存的所有文件执行一次完整的重新验证。",
+		Usage:   "[选项]",
+		FlagSet: verifyFullFlagSet,
+		Run: func(args []string) error {
+			cacheDir := verifyFullFlagSet.GetString("cache-dir")
+			gateway := verifyFullFlagSet.GetString("gateway")
+			concurrency := verifyFullFlagSet.GetInt("concurrency")
+			noSkip := verifyFullFlagSet.GetBool("no-skip")
+			quiet := verifyFullFlagSet.GetBool("quiet")
+
+			// 获取当前安全配置
+			verifyPoW, verifyIndex, verifyRef, verifyIntegrity := config.ConfigFile.GetVerifyConfig()
+
+			gatewayURLs := []string{gateway}
+			if gateway == "" || gateway == "https://arweave.net" {
+				gatewayURLs = []string{"https://arweave.net", "https://ar-io.net"}
+			}
+
+			fvCfg := verify.FullVerifierConfig{
+				CacheDir:              cacheDir,
+				GatewayURLs:           gatewayURLs,
+				MaxConcurrency:        concurrency,
+				VerifyPoW:             verifyPoW,
+				VerifyIndex:           verifyIndex,
+				VerifyReferenceChain:  verifyRef,
+				VerifyIntegrity:       verifyIntegrity,
+				SkipMissingMeta:       !noSkip,
+			}
+
+			fv := verify.NewFullVerifier(fvCfg)
+
+			if !quiet {
+				fmt.Println("开始全量验证...")
+				fmt.Printf("  缓存目录: %s\n", cacheDir)
+				fmt.Printf("  并发数: %d\n", concurrency)
+				fmt.Printf("  验证步骤: PoW=%v Index=%v RefChain=%v Integrity=%v\n",
+					verifyPoW, verifyIndex, verifyRef, verifyIntegrity)
+				fmt.Println()
+			}
+
+			report, err := fv.VerifyAll()
+			if err != nil {
+				return fmt.Errorf("全量验证失败: %w", err)
+			}
+
+			if quiet {
+				// 静默模式：仅输出汇总行
+				fmt.Printf("总文件: %d | 已验证: %d | 通过: %d | 失败: %d | 跳过: %d | 耗时: %s\n",
+					report.TotalFiles, report.VerifiedFiles,
+					report.PassedFiles, report.FailedFiles,
+					report.SkippedFiles, report.TotalDuration.Round(100*time.Millisecond))
+			} else {
+				fmt.Print(verify.FormatReport(report))
+			}
+
+			if report.HasFailures() {
+				return fmt.Errorf("全量验证完成：%d 个文件验证失败", report.FailedFiles)
+			}
+
+			return nil
 		},
 	})
 
