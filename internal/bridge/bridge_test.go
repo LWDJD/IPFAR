@@ -46,8 +46,8 @@ func TestNewBridgeFromPreset(t *testing.T) {
 	}{
 		{"strict", true, true, true, true, false},
 		{"balanced", true, true, false, true, false},
-		{"light", true, false, true, false, false},
-		{"trusted", false, false, false, false, false},
+		{"light", true, true, true, false, false},
+		{"trusted", false, true, false, false, false},
 		{"invalid", false, false, false, false, true},
 	}
 
