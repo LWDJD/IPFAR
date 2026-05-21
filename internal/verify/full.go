@@ -9,6 +9,7 @@
 package verify
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,7 +19,6 @@ import (
 
 	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
 	"github.com/LWDJD/ipfar-sdk/verify/pipeline"
-	"github.com/LWDJD/ipfar-sdk/verify/pow"
 
 	"github.com/lwdjd/IPFAR/internal/download"
 	"github.com/lwdjd/IPFAR/internal/log"
@@ -151,6 +151,74 @@ func NewFullVerifier(config FullVerifierConfig) *FullVerifier {
 // GetPipelineConfig 获取管道配置（用于外部检查）
 func (fv *FullVerifier) GetPipelineConfig() pipeline.VerifyConfig {
 	return fv.pipelineConfig
+}
+
+// Verify 使用 SDK 4 阶段验证管道执行单次验证
+// 规范参考: ipfar-specs/V1/项目规划.md §4.1 验证流程
+//
+// 验证流程:
+//  1. 元数据合法性校验（强制）
+//  2. PoW 验证（< 100 MiB 时强制）
+//  3. CAR v2 Index 完整性验证
+//  4. 引用链验证
+//  5. 数据完整性验证
+func (fv *FullVerifier) Verify(ctx context.Context, input *VerifyInput) (*VerifyResult, error) {
+	if input == nil || input.Meta == nil {
+		return NewVerifyResultError(fmt.Errorf("验证输入无效：元数据不能为空")), nil
+	}
+
+	meta := input.Meta
+
+	// 确定使用的配置：input.Config 优先，否则使用 FullVerifier 的 pipelineConfig
+	config := fv.pipelineConfig
+	if input.Config != nil {
+		config = *input.Config
+	}
+
+	// 创建 SDK 管道
+	p := pipeline.NewPipeline(config)
+
+	// 如果有进度回调，注入进度中间件
+	if input.Callback != nil {
+		pm := NewProgressMiddleware(input.Callback)
+		pm.WrapPipeline(p)
+	}
+
+	// 如果提供了 CAR 文件路径，配置 Index/Integrity 验证器
+	carAvailable := false
+	if input.CARPath != "" {
+		p.SetCarFile(input.CARPath)
+		carAvailable = true
+	}
+
+	// 注入 PoW 验证器（使用桥封装，带日志）
+	p.SetPoWVerifier(func(powStr, powAlg, rootCID, dataTXID string, dataSize int64) error {
+		err := VerifyPoW(powStr, powAlg, rootCID, dataTXID, dataSize)
+		if err != nil {
+			log.Warn("PoW 验证失败：root_cid=%s, error=%v", rootCID, err)
+		}
+		return err
+	})
+
+	// 执行管道验证
+	pipeResult := p.Verify(meta, carAvailable)
+
+	// 转换为桥节点结果
+	result := NewVerifyResult(pipeResult, meta)
+
+	// 记录结果
+	if result.Passed {
+		log.Info("验证通过 ✅ root_cid=%s, steps=%d", meta.RootCID, len(result.Steps))
+	} else {
+		log.Warn("验证失败 ❌ root_cid=%s", meta.RootCID)
+		for _, r := range result.Steps {
+			if !r.Passed && !r.Skipped {
+				log.Warn("  - %s: %s", r.Step, r.Error)
+			}
+		}
+	}
+
+	return result, nil
 }
 
 // VerifyAll 执行全量验证
@@ -338,13 +406,13 @@ func (fv *FullVerifier) verifyOne(cf carFileInfo) FullVerifyResult {
 }
 
 // runPipeline 运行验证管道
-// 直接使用 SDK pipeline，避免循环导入 bridge 包
+// 使用 SDK 4 阶段验证管道（通过桥封装层）
 func (fv *FullVerifier) runPipeline(meta *sdkmeta.Metadata, carAvailable bool) *pipeline.PipelineResult {
 	p := pipeline.NewPipeline(fv.pipelineConfig)
 
-	// 注入带有日志的 PoW 验证器
+	// 注入 PoW 验证器（使用桥封装，带日志）
 	p.SetPoWVerifier(func(powStr, powAlg, rootCID, dataTXID string, dataSize int64) error {
-		err := pow.Verify(powStr, powAlg, rootCID, dataTXID, dataSize)
+		err := VerifyPoW(powStr, powAlg, rootCID, dataTXID, dataSize)
 		if err != nil {
 			log.Warn("全量验证 PoW 失败：root_cid=%s, error=%v", rootCID, err)
 		}
@@ -369,6 +437,7 @@ func (fv *FullVerifier) runPipeline(meta *sdkmeta.Metadata, carAvailable bool) *
 }
 
 // fetchMetadata 从 Arweave 网关获取元数据交易
+// 使用桥封装层的 ParseAndValidateMetadata / ParseAndValidateMetadataBase64URL
 func (fv *FullVerifier) fetchMetadata(txID string) (*sdkmeta.Metadata, error) {
 	data, err := fv.gateway.FetchTransaction(txID)
 	if err != nil {
@@ -376,10 +445,10 @@ func (fv *FullVerifier) fetchMetadata(txID string) (*sdkmeta.Metadata, error) {
 	}
 
 	// 先尝试 JSON 直接解析
-	meta, err := sdkmeta.ParseAndValidate(data)
+	meta, err := ParseAndValidateMetadata(data)
 	if err != nil {
 		// 尝试 Base64URL 解码
-		meta, err = sdkmeta.ParseAndValidateBase64URL(string(data))
+		meta, err = ParseAndValidateMetadataBase64URL(string(data))
 		if err != nil {
 			return nil, fmt.Errorf("解析元数据失败: %w", err)
 		}
