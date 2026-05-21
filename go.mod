@@ -3,7 +3,7 @@ module github.com/lwdjd/IPFAR
 go 1.25.7
 
 require (
-	github.com/LWDJD/ipfar-sdk v0.0.0-20260513012356-0731f65950da
+	github.com/LWDJD/ipfar-sdk v0.0.0
 	github.com/Xuanwo/go-locale v1.1.3
 	github.com/dgraph-io/badger/v4 v4.9.1
 	github.com/ipfs/go-cid v0.6.1
@@ -122,4 +122,4 @@ require (
 
 replace github.com/libp2p/go-libp2p-kad-dht => /AstrBot/data/kad-dht-repo/go-libp2p-kad-dht
 
-replace github.com/LWDJD/ipfar-sdk => /AstrBot/data/workspaces/QQbot_FriendMessage_6E6F7FCAC8E243D639009B3DDF7DFE39/ipfar-sdk
+replace github.com/LWDJD/ipfar-sdk => ../ipfar-sdk
