@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/LWDJD/ipfar-sdk/arweave"
 	"github.com/LWDJD/ipfar-sdk/verify/metadata"
 	"github.com/LWDJD/ipfar-sdk/verify/pipeline"
 	"github.com/LWDJD/ipfar-sdk/verify/pow"
@@ -15,7 +16,8 @@ import (
 
 // Bridge 桥接器，封装核心验证和工作流
 type Bridge struct {
-	config pipeline.VerifyConfig
+	config        pipeline.VerifyConfig
+	gatewayClient *arweave.GatewayClient
 }
 
 // NewBridge 创建新的桥接器
@@ -37,6 +39,11 @@ func NewBridgeFromPreset(preset string) (*Bridge, error) {
 		return nil, err
 	}
 	return &Bridge{config: config}, nil
+}
+
+// SetGatewayClient 设置 Arweave 网关客户端，用于引用链验证等网络操作。
+func (b *Bridge) SetGatewayClient(client *arweave.GatewayClient) {
+	b.gatewayClient = client
 }
 
 // VerifyMetadata 验证元数据 JSON
@@ -94,6 +101,13 @@ func (b *Bridge) VerifyPoW(meta *metadata.Metadata) error {
 // carAvailable 表示 CAR 文件是否已经下载可用
 func (b *Bridge) RunPipeline(meta *metadata.Metadata, carAvailable bool) *pipeline.PipelineResult {
 	p := pipeline.NewPipeline(b.config)
+
+	// 注入网关客户端（用于引用链验证等网络操作）
+	if b.gatewayClient != nil {
+		p.SetGatewayClient(b.gatewayClient)
+	} else if b.config.VerifyReferenceChain {
+		log.Warn("验证管道：引用链验证已启用但未配置网关客户端，引用链验证将被跳过")
+	}
 
 	// 注入日志记录
 	p.SetPoWVerifier(func(powStr, powAlg, rootCID, dataTXID string, dataSize int64) error {

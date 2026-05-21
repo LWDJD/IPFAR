@@ -122,9 +122,9 @@ func (c *Config) GetVerifyConfig() (verifyPoW, verifyIndex, verifyRef, verifyInt
 	case "balanced":
 		return true, true, false, true
 	case "light":
-		return true, false, true, false
+		return true, true, true, false // spec §3.4: Index always enforced
 	case "trusted":
-		return false, false, false, false
+		return false, true, false, false // spec §3.4: Index always enforced
 	default:
 		return c.VerifyPoW, c.VerifyIndex, c.VerifyReferenceChain, c.VerifyIntegrity
 	}
