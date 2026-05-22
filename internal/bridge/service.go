@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -378,23 +377,37 @@ func (s *Service) initBitswap(cfg ServiceConfig) error {
 		return fmt.Errorf("创建 BlockFetcher 失败: %w", err)
 	}
 
-	// 5. 创建 Bitswap 服务
+	// 5. 创建 Bitswap 服务（端口被占用时自动 +1 重试）
 	bitswapPort := cfg.BitswapPort
 	if bitswapPort <= 0 {
 		bitswapPort = 4001
 	}
-	bitswapCfg := bitswap.DefaultConfig()
-	bitswapCfg.ListenAddr = fmt.Sprintf(":%d", bitswapPort)
-	bitswapCfg.DelayedReply = true
-	bitswapCfg.Cache = blockCache
-	bitswapCfg.Timeout = 30 * time.Second
 
-	s.bitswapService, err = bitswap.New(bitswapCfg)
-	if err != nil {
-		if strings.Contains(err.Error(), "address already in use") {
-			return fmt.Errorf("Bitswap 端口 %d 被占用，请修改 BitswapPort 配置或释放端口", bitswapPort)
+	maxPortAttempts := 5
+	var lastErr error
+	for attempt := 0; attempt < maxPortAttempts; attempt++ {
+		listenAddr := fmt.Sprintf(":%d", bitswapPort+attempt)
+
+		bitswapCfg := bitswap.DefaultConfig()
+		bitswapCfg.ListenAddr = listenAddr
+		bitswapCfg.DelayedReply = true
+		bitswapCfg.Cache = blockCache
+		bitswapCfg.Timeout = 30 * time.Second
+
+		s.bitswapService, err = bitswap.New(bitswapCfg)
+		if err == nil {
+			if attempt > 0 {
+				log.Warn("桥接服务：Bitswap 端口 %d 被占用，已自动切换至 %d",
+					cfg.BitswapPort, bitswapPort+attempt)
+			}
+			break
 		}
-		return fmt.Errorf("创建 Bitswap 服务失败: %w", err)
+		lastErr = err
+	}
+
+	if s.bitswapService == nil {
+		return fmt.Errorf("Bitswap 无法绑定端口（尝试了 %d 个端口）: %w",
+			maxPortAttempts, lastErr)
 	}
 
 	// 6. 注册 BlockFetcher 到 Bitswap
