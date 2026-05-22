@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,12 +77,15 @@ func DefaultServiceConfig() ServiceConfig {
 	return ServiceConfig{
 		Preset:                 pipeline.SecurityLight,
 		DiscoveryMode:          "sampling",
-		MinBlockHeight:         0,
+		MinBlockHeight:         1919626,
 		MaxBlockHeight:         0, // 动态跟随
 		PollInterval:           2 * time.Minute,
 		CacheDir:               "cache/car",
 		MaxFileSize:            0, // 不限制
-		CarAvailable:           true,
+		BitswapEnabled:         true,
+		BitswapPort:            4001,
+		CacheSize:              1 << 30, // 1 GB
+		CarAvailable:           false,   // 按需拉取模式，不预下载
 		OnlineVerify:           false,
 		OnlineSampleCount:      5,
 		OnlineMaxConcurrency:   4,
@@ -206,7 +210,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	// ============================================================
 	if cfg.BitswapEnabled {
 		if err := svc.initBitswap(cfg); err != nil {
-			log.Warn("桥接服务：Bitswap 初始化失败（非致命）: %v", err)
+			log.Warn("桥接服务：Bitswap 初始化失败（非致命），服务将以降级模式运行，不使用 Bitswap 按需拉取: %v", err)
 		}
 	}
 
@@ -387,6 +391,9 @@ func (s *Service) initBitswap(cfg ServiceConfig) error {
 
 	s.bitswapService, err = bitswap.New(bitswapCfg)
 	if err != nil {
+		if strings.Contains(err.Error(), "address already in use") {
+			return fmt.Errorf("Bitswap 端口 %d 被占用，请修改 BitswapPort 配置或释放端口", bitswapPort)
+		}
 		return fmt.Errorf("创建 Bitswap 服务失败: %w", err)
 	}
 
