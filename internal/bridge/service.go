@@ -33,6 +33,7 @@ type ServiceConfig struct {
 	VerifyIntegrity bool
 
 	// Discovery 发现配置
+	DiscoveryMode  string // "sampling"（默认）或 "graphql"
 	MinBlockHeight uint64
 	MaxBlockHeight uint64
 	PollInterval   time.Duration
@@ -64,6 +65,7 @@ type ServiceConfig struct {
 func DefaultServiceConfig() ServiceConfig {
 	return ServiceConfig{
 		Preset:                 pipeline.SecurityLight,
+		DiscoveryMode:          "sampling",
 		MinBlockHeight:         0,
 		MaxBlockHeight:         0, // 动态跟随
 		PollInterval:           2 * time.Minute,
@@ -189,8 +191,31 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		}
 	}
 
-	log.Info("桥接服务：初始化完成 preset=%s verify_pow=%v verify_index=%v verify_ref=%v verify_integrity=%v online_verify=%v dht=%v",
-		cfg.Preset, verifyPoW, verifyIndex, verifyRef, verifyIntegrity, cfg.OnlineVerify, cfg.DHTEnabled && svc.dhtProvider != nil)
+	// 根据 DiscoveryMode 创建对应的 BlockChecker
+	switch cfg.DiscoveryMode {
+	case "graphql":
+		gwURL := "https://arweave.net"
+		if len(cfg.GatewayURLs) > 0 {
+			gwURL = cfg.GatewayURLs[0]
+		}
+		checkerCfg := discovery.DefaultGraphQLCheckerConfig()
+		checkerCfg.GatewayURL = gwURL
+		checkerCfg.Timeout = cfg.PollInterval
+		if checkerCfg.Timeout <= 0 {
+			checkerCfg.Timeout = 30 * time.Second
+		}
+		graphqlChecker := discovery.NewGraphQLBlockChecker(checkerCfg)
+		svc.SetBlockChecker(graphqlChecker)
+		log.Info("桥接服务：发现模式 = graphql (网关: %s)", gwURL)
+	case "sampling", "":
+		// 随机抽样模式：不预设 checker，由外部通过 SetBlockChecker 注入
+		log.Info("桥接服务：发现模式 = sampling（等待外部注入 BlockChecker）")
+	default:
+		log.Warn("桥接服务：未知发现模式 %q，使用 sampling 模式", cfg.DiscoveryMode)
+	}
+
+	log.Info("桥接服务：初始化完成 preset=%s verify_pow=%v verify_index=%v verify_ref=%v verify_integrity=%v online_verify=%v dht=%v discovery=%s",
+		cfg.Preset, verifyPoW, verifyIndex, verifyRef, verifyIntegrity, cfg.OnlineVerify, cfg.DHTEnabled && svc.dhtProvider != nil, cfg.DiscoveryMode)
 
 	return svc, nil
 }
@@ -208,6 +233,9 @@ func (s *Service) getOnlineVerifier() *verify.OnlineVerifier {
 }
 
 // initDHTProvider 初始化 DHT 内容发布提供器
+//
+// 如果配置了 DHTListenAddresses，会自动创建 libp2p host 并启动 DHT Provider。
+// 否则只记录配置，由外部通过 SetDHTProvider 注入 Provider。
 func (s *Service) initDHTProvider() error {
 	cfg := dht.DefaultConfig()
 	cfg.Enabled = true
@@ -229,15 +257,25 @@ func (s *Service) initDHTProvider() error {
 		}
 	}
 
-	// 创建 libp2p host
-	// TODO: 完整的 libp2p host 创建，现在是简化版本
-	// 实际部署时需要配置监听地址、NAT 穿透等
-	log.Info("桥接服务：DHT Provider 配置: mode=%s concurrency=%d reprovide=%s",
-		cfg.Mode, cfg.ProvideConcurrency, cfg.ReprovideInterval)
+	// 如果配置了监听地址，自动创建 host 和 provider
+	if len(s.config.DHTListenAddresses) > 0 {
+		hostCfg := dht.DefaultHostConfig()
+		hostCfg.ListenAddresses = s.config.DHTListenAddresses
+		if len(cfg.BootstrapPeers) > 0 {
+			hostCfg.BootstrapPeers = cfg.BootstrapPeers
+		}
 
-	// DHT Provider 需要 libp2p host，由外部注入
-	// initDHTProvider 在 host 为 nil 时会推迟到 Start 阶段
-	s.dhtProvider = nil // 由外部通过 SetDHTProvider 注入
+		provider, _, err := dht.NewProviderWithHost(hostCfg, cfg)
+		if err != nil {
+			return fmt.Errorf("创建 DHT Provider (含 host) 失败: %w", err)
+		}
+		s.dhtProvider = provider
+		log.Info("桥接服务：DHT Provider 已自动创建并启动")
+	} else {
+		log.Info("桥接服务：DHT Provider 配置: mode=%s concurrency=%d reprovide=%s（等待外部注入 host）",
+			cfg.Mode, cfg.ProvideConcurrency, cfg.ReprovideInterval)
+		s.dhtProvider = nil // 由外部通过 SetDHTProvider 注入
+	}
 
 	return nil
 }
