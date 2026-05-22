@@ -32,6 +32,16 @@ import (
 )
 
 // ============================================================
+// BlockFetcher 接口
+// ============================================================
+
+// BlockFetcher 按需获取 IPFS 块的接口
+// 当 Bitswap 收到 WantList 且本地缓存未命中时，调用此接口按需获取数据。
+type BlockFetcher interface {
+	FetchBlock(ctx context.Context, cid string) ([]byte, error)
+}
+
+// ============================================================
 // 常量
 // ============================================================
 
@@ -108,6 +118,12 @@ type Service struct {
 	// WantList: key=CID string, value=引用计数
 	wantList   map[string]int32
 	wantListMu sync.Mutex
+
+	// BlockFetcher 按需拉取器（可选）
+	// 设置后，当 WantList 中请求的块不在本地缓存中时，
+	// Bitswap 会调用 blockFetcher.FetchBlock() 按需从 Arweave 获取。
+	blockFetcher   BlockFetcher
+	blockFetcherMu sync.RWMutex
 
 	// 统计
 	blocksRequested uint64
@@ -270,6 +286,23 @@ func (s *Service) Stats() Stats {
 		BlocksCached:    atomic.LoadUint64(&s.blocksCached),
 		CacheStats:      s.cache.Stats(),
 	}
+}
+
+// SetBlockFetcher 设置按需拉取器
+// 设置后，当 WantList 中请求的块不在本地缓存中时，
+// Bitswap 会调用 blockFetcher.FetchBlock() 按需从 Arweave 获取。
+func (s *Service) SetBlockFetcher(fetcher BlockFetcher) {
+	s.blockFetcherMu.Lock()
+	defer s.blockFetcherMu.Unlock()
+	s.blockFetcher = fetcher
+	log.Info("Bitswap：BlockFetcher 已注册")
+}
+
+// GetBlockFetcher 获取按需拉取器
+func (s *Service) GetBlockFetcher() BlockFetcher {
+	s.blockFetcherMu.RLock()
+	defer s.blockFetcherMu.RUnlock()
+	return s.blockFetcher
 }
 
 // ============================================================
@@ -564,13 +597,44 @@ func (s *Service) handleWantList(conn net.Conn) {
 
 	// 回复每个请求的 CID
 	for _, c := range cids {
-		data, found, _ := s.cache.Get(c.String())
+		cidStr := c.String()
+
+		// 1. 先查本地缓存
+		data, found, _ := s.cache.Get(cidStr)
 		if found {
 			s.sendBlock(conn, c, data)
 			atomic.AddUint64(&s.blocksServed, 1)
-		} else {
-			s.sendDontHave(conn, c)
+			continue
 		}
+
+		// 2. 缓存未命中 → 尝试按需拉取
+		fetcher := s.GetBlockFetcher()
+		if fetcher != nil {
+			log.Debug("Bitswap：缓存未命中 %s，尝试按需拉取...", cidStr)
+
+			fetchCtx, cancel := context.WithTimeout(s.ctx, s.config.Timeout)
+			fetchedData, err := fetcher.FetchBlock(fetchCtx, cidStr)
+			cancel()
+
+			if err != nil {
+				log.Warn("Bitswap：按需拉取失败 %s: %v", cidStr, err)
+				s.sendDontHave(conn, c)
+				continue
+			}
+
+			// 写入本地缓存
+			s.cache.Put(cidStr, fetchedData)
+			atomic.AddUint64(&s.blocksCached, 1)
+
+			// 发送块
+			s.sendBlock(conn, c, fetchedData)
+			atomic.AddUint64(&s.blocksServed, 1)
+			log.Info("Bitswap：按需拉取成功 %s (%d bytes)", cidStr, len(fetchedData))
+			continue
+		}
+
+		// 3. 没有 BlockFetcher → 回复 dont-have
+		s.sendDontHave(conn, c)
 	}
 }
 
