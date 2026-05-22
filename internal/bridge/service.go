@@ -10,12 +10,17 @@ import (
 
 	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
 	"github.com/LWDJD/ipfar-sdk/verify/pipeline"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/ipfs/go-cid"
 
+	"github.com/lwdjd/IPFAR/internal/bitswap"
+	"github.com/lwdjd/IPFAR/internal/cache"
 	"github.com/lwdjd/IPFAR/internal/discovery"
 	"github.com/lwdjd/IPFAR/internal/dht"
 	"github.com/lwdjd/IPFAR/internal/download"
+	"github.com/lwdjd/IPFAR/internal/index"
 	"github.com/lwdjd/IPFAR/internal/log"
+	"github.com/lwdjd/IPFAR/internal/store"
 	"github.com/lwdjd/IPFAR/internal/verify"
 )
 
@@ -59,6 +64,11 @@ type ServiceConfig struct {
 	DHTReprovideInterval string   // 重新提供间隔
 	DHTProvideConcurrency int    // 提供并发数
 	DHTListenAddresses  []string // libp2p 监听地址
+
+	// Bitswap 按需拉取配置
+	BitswapEnabled bool   // 是否启用 Bitswap 服务
+	BitswapPort    int    // Bitswap 监听端口（默认 4001）
+	CacheSize      int64  // 缓存最大字节数（默认 1GB，用于 Bitswap 块缓存）
 }
 
 // DefaultServiceConfig 返回默认服务配置
@@ -92,6 +102,13 @@ type Service struct {
 	// 在线验证器（延迟初始化）
 	onlineVerifier     *verify.OnlineVerifier
 	onlineVerifierOnce sync.Once
+
+	// Bitswap 按需拉取架构
+	bitswapService *bitswap.Service // Bitswap 服务端
+	indexStore     *index.Store     // CID → Arweave 索引
+	blockFetcher   *BlockFetcher    // 按需拉取器
+	badgerDB       *badger.DB       // Badger 实例（复用）
+	cacheStore     *store.Store     // KV 存储（复用）
 
 	// 并发控制信号量
 	downloadSema chan struct{} // 完整下载并发控制
@@ -182,6 +199,15 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		stats: ServiceStats{
 			StartedAt: time.Now(),
 		},
+	}
+
+	// ============================================================
+	// Bitswap 按需拉取架构初始化
+	// ============================================================
+	if cfg.BitswapEnabled {
+		if err := svc.initBitswap(cfg); err != nil {
+			log.Warn("桥接服务：Bitswap 初始化失败（非致命）: %v", err)
+		}
 	}
 
 	// 初始化 DHT Provider
@@ -280,6 +306,98 @@ func (s *Service) initDHTProvider() error {
 	return nil
 }
 
+// initBitswap 初始化 Bitswap 按需拉取架构
+//
+// 创建链路：Badger DB → index.Store → BlockFetcher → bitswap.Service
+func (s *Service) initBitswap(cfg ServiceConfig) error {
+	// 1. 创建 Badger DB（复用 store 配置）
+	badgerCfg := store.DefaultStoreConfig()
+	badgerCfg.Dir = cfg.CacheDir + "/badger"
+	s.badgerDB = nil // 延迟初始化，避免重复创建
+
+	// 如果已有 store 实例，复用其 Badger DB
+	if s.cacheStore == nil {
+		var err error
+		s.cacheStore, err = store.New(badgerCfg)
+		if err != nil {
+			return fmt.Errorf("创建 Badger 存储失败: %w", err)
+		}
+	}
+
+	// 使用 cacheStore 的底层 Badger DB（需要通过反射或导出方法获取）
+	// 暂时创建独立的 Badger 实例用于索引
+	indexBadgerCfg := badger.DefaultOptions(cfg.CacheDir + "/index")
+	indexBadgerCfg.MemTableSize = 16 << 20
+	indexBadgerCfg.NumMemtables = 2
+	indexBadgerCfg.BlockCacheSize = 8 << 20
+	indexBadgerCfg.IndexCacheSize = 4 << 20
+	indexBadgerCfg.ValueLogFileSize = 32 << 20
+	indexBadgerCfg.Logger = nil
+
+	db, err := badger.Open(indexBadgerCfg)
+	if err != nil {
+		return fmt.Errorf("打开索引 Badger 失败: %w", err)
+	}
+	s.badgerDB = db
+
+	// 2. 创建索引存储
+	s.indexStore = index.NewStore(db)
+	log.Info("桥接服务：索引存储已初始化")
+
+	// 3. 创建 Bitswap 块缓存
+	cacheSize := cfg.CacheSize
+	if cacheSize <= 0 {
+		cacheSize = 1 << 30 // 默认 1 GB
+	}
+	blockCacheCfg := cache.CacheConfig{
+		Dir:     cfg.CacheDir + "/blocks",
+		MaxSize: cacheSize,
+	}
+	blockCache, err := cache.New(blockCacheCfg)
+	if err != nil {
+		return fmt.Errorf("创建块缓存失败: %w", err)
+	}
+
+	// 4. 创建按需拉取器
+	bfCfg := BlockFetcherConfig{
+		IndexStore:             s.indexStore,
+		Cache:                  blockCache,
+		Gateway:                s.fetcher.GetGateway(),
+		MaxConcurrentDownloads: cfg.DownloadMaxConcurrency,
+	}
+	if bfCfg.MaxConcurrentDownloads <= 0 {
+		bfCfg.MaxConcurrentDownloads = 4
+	}
+
+	s.blockFetcher, err = NewBlockFetcher(bfCfg)
+	if err != nil {
+		return fmt.Errorf("创建 BlockFetcher 失败: %w", err)
+	}
+
+	// 5. 创建 Bitswap 服务
+	bitswapPort := cfg.BitswapPort
+	if bitswapPort <= 0 {
+		bitswapPort = 4001
+	}
+	bitswapCfg := bitswap.DefaultConfig()
+	bitswapCfg.ListenAddr = fmt.Sprintf(":%d", bitswapPort)
+	bitswapCfg.DelayedReply = true
+	bitswapCfg.Cache = blockCache
+	bitswapCfg.Timeout = 30 * time.Second
+
+	s.bitswapService, err = bitswap.New(bitswapCfg)
+	if err != nil {
+		return fmt.Errorf("创建 Bitswap 服务失败: %w", err)
+	}
+
+	// 6. 注册 BlockFetcher 到 Bitswap
+	s.bitswapService.SetBlockFetcher(s.blockFetcher)
+
+	log.Info("桥接服务：Bitswap 按需拉取架构已初始化 port=%d cache_size=%dMB",
+		bitswapPort, cacheSize>>20)
+	return nil
+}
+
 // SetDHTProvider 设置 DHT Provider（在 libp2p host 初始化后调用）
 func (s *Service) SetDHTProvider(provider *dht.Provider) {
 	s.dhtProvider = provider
@@ -299,6 +417,11 @@ func (s *Service) Start() error {
 	log.Info("  在线验证: %v", s.config.OnlineVerify)
 	log.Info("  下载并发: %d | 在线验证并发: %d",
 		cap(s.downloadSema), cap(s.onlineSema))
+	if s.bitswapService != nil {
+		log.Info("  Bitswap: 已启用 (端口 %d)", s.config.BitswapPort)
+	} else {
+		log.Info("  Bitswap: 未启用")
+	}
 	if s.dhtProvider != nil {
 		log.Info("  DHT 内容发布: 已启用")
 	} else if s.config.DHTEnabled {
@@ -336,10 +459,28 @@ func (s *Service) Stop() {
 	if s.sampler != nil {
 		s.sampler.Stop()
 	}
+	// 停止 Bitswap 服务
+	if s.bitswapService != nil {
+		if err := s.bitswapService.Close(); err != nil {
+			log.Warn("桥接服务：停止 Bitswap 失败: %v", err)
+		}
+	}
 	// 停止 DHT Provider
 	if s.dhtProvider != nil {
 		if err := s.dhtProvider.Stop(); err != nil {
 			log.Warn("桥接服务：停止 DHT Provider 失败: %v", err)
+		}
+	}
+	// 关闭 Badger 数据库
+	if s.badgerDB != nil {
+		if err := s.badgerDB.Close(); err != nil {
+			log.Warn("桥接服务：关闭 Badger 失败: %v", err)
+		}
+	}
+	// 关闭 KV 存储
+	if s.cacheStore != nil {
+		if err := s.cacheStore.Close(); err != nil {
+			log.Warn("桥接服务：关闭 KV 存储失败: %v", err)
 		}
 	}
 	s.wg.Wait()
@@ -455,6 +596,15 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 	// 需要重新获取 Bundle 交易数据（包含所有 Items），并提取 CAR Item
 	if meta.IsSameBundle() {
 		s.cacheSameBundleData(txID, meta)
+	}
+
+	// ============================================================
+	// Bitswap 按需拉取路径：索引 CID，不下载完整 CAR
+	// ============================================================
+	if s.bitswapService != nil && s.indexStore != nil {
+		s.indexMetadataCIDs(txID, meta)
+		// Bitswap 模式：索引完成后，依赖 Bitswap 按需拉取
+		// 仍然运行快速验证（元数据 + PoW）
 	}
 
 	// 元数据已在 FetchMetadataByTXID 中校验过
@@ -824,6 +974,90 @@ func (s *Service) cacheSameBundleData(metadataTxID string, meta *sdkmeta.Metadat
 // GetOnlineVerifier 获取在线验证器
 func (s *Service) GetOnlineVerifier() *verify.OnlineVerifier {
 	return s.getOnlineVerifier()
+}
+
+// ============================================================
+// Bitswap 按需拉取：CID 索引
+// ============================================================
+
+// indexMetadataCIDs 将元数据中的 CID 信息写入索引
+//
+// 为 Bitswap 按需拉取做准备：
+//   - 索引 RootCID → Arweave 交易位置
+//   - 索引 Reference 中的 CID → 对应 Arweave 交易位置
+func (s *Service) indexMetadataCIDs(metadataTxID string, meta *sdkmeta.Metadata) {
+	if s.indexStore == nil {
+		return
+	}
+
+	// 索引 RootCID
+	rootEntry := &index.Entry{
+		CID:        meta.RootCID,
+		DataTXID:   meta.DataTXID,
+		BundleTXID: meta.BundleTXID,
+		Height:     int64(meta.DataHeight),
+		DataSize:   int64(meta.DataSize),
+		RawIndex:   nil, // 暂无 CAR Index
+	}
+	if err := s.indexStore.Put(rootEntry); err != nil {
+		log.Warn("桥接服务：索引 RootCID 失败 %s: %v", meta.RootCID, err)
+	} else {
+		log.Debug("桥接服务：已索引 RootCID %s → tx=%s", meta.RootCID, meta.DataTXID)
+	}
+
+	// 索引 Reference 中的 CID
+	if meta.HasReference() {
+		refMap := *meta.Reference
+		for refTXID, entry := range refMap {
+			for _, cidStr := range entry.CIDs {
+				refEntry := &index.Entry{
+					CID:        cidStr,
+					DataTXID:   refTXID,
+					BundleTXID: entry.BundleTXID,
+					Height:     int64(entry.Height),
+					DataSize:   0, // 引用条目不记录大小
+					RawIndex:   nil,
+				}
+				if err := s.indexStore.Put(refEntry); err != nil {
+					log.Warn("桥接服务：索引引用 CID 失败 %s: %v", cidStr, err)
+				} else {
+					log.Debug("桥接服务：已索引引用 CID %s → tx=%s", cidStr, refTXID)
+				}
+			}
+		}
+	}
+
+	log.Info("桥接服务：CID 索引完成 root=%s", meta.RootCID)
+}
+
+// ============================================================
+// Bitswap 相关公开方法
+// ============================================================
+
+// GetBitswapService 获取 Bitswap 服务
+func (s *Service) GetBitswapService() *bitswap.Service {
+	return s.bitswapService
+}
+
+// GetIndexStore 获取 CID 索引存储
+func (s *Service) GetIndexStore() *index.Store {
+	return s.indexStore
+}
+
+// GetBlockFetcher 获取按需拉取器
+func (s *Service) GetBlockFetcher() *BlockFetcher {
+	return s.blockFetcher
+}
+
+// SetBadgerDB 注入外部 Badger DB（用于共享存储）
+// 在 initBitswap 之前调用以复用一个 Badger 实例
+func (s *Service) SetBadgerDB(db *badger.DB) {
+	s.badgerDB = db
+}
+
+// SetKVStore 注入外部 KV 存储
+func (s *Service) SetKVStore(kvStore *store.Store) {
+	s.cacheStore = kvStore
 }
 
 // ============================================================
