@@ -75,7 +75,7 @@ type ServiceConfig struct {
 func DefaultServiceConfig() ServiceConfig {
 	return ServiceConfig{
 		Preset:                 pipeline.SecurityLight,
-		DiscoveryMode:          "sampling",
+		DiscoveryMode:          "graphql",
 		MinBlockHeight:         1919626,
 		MaxBlockHeight:         0, // 动态跟随
 		PollInterval:           2 * time.Minute,
