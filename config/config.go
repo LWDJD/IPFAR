@@ -30,6 +30,14 @@ type Config struct {
 	GatewayTimeoutSecs       int      `json:"gateway_timeout_secs,omitempty"`        // 网关请求超时（秒，默认 30）
 	GatewayMaxRetries        int      `json:"gateway_max_retries,omitempty"`         // 最大重试次数（默认 3）
 
+	// 发现配置
+	DiscoveryMode    string `json:"discovery_mode,omitempty"`    // "sampling"（随机游走）、"graphql"（单块查询）、"graphql-scan"（顺序扫描，默认）
+	MinBlockHeight   uint64 `json:"min_block_height,omitempty"`  // 最小扫描高度（默认 1919626）
+	MaxBlockHeight   uint64 `json:"max_block_height,omitempty"`  // 最大扫描高度（0=动态）
+	PollIntervalSecs int    `json:"poll_interval_secs,omitempty"` // 轮询间隔（秒，默认 120）
+	ScanBatchSize    int    `json:"scan_batch_size,omitempty"`   // 扫描批次大小（默认 100）
+	ScanQueryDelayMs int    `json:"scan_query_delay_ms,omitempty"` // 扫描查询延迟（毫秒，默认 2000）
+
 	// DHT 内容发布配置（规范 P3-1）
 	DHT DHTConfig `json:"dht,omitempty"`
 }
