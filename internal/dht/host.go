@@ -36,6 +36,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/lwdjd/IPFAR/internal/log"
+	"github.com/lwdjd/IPFAR/internal/version"
 )
 
 // HostConfig libp2p host 配置
@@ -161,6 +162,9 @@ func NewHost(cfg HostConfig) (host.Host, error) {
 		libp2p.Transport(libp2pwebrtc.New),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Security(tls.ID, tls.New),
+		libp2p.ShareTCPListener(),
+		libp2p.UserAgent("IPFAR/"+version.Short()),
+		libp2p.ProtocolVersion("ipfar/1.0.0"),
 	}
 
 	// NAT 端口映射 (UPnP / NAT-PMP)
