@@ -307,6 +307,10 @@ func RegisterCommands() {
 	serveFlagSet.DefineString("dht-mode", "", "server", "DHT 模式：server 或 client", false)
 	serveFlagSet.DefineString("dht-reprovide", "", "12h", "DHT 重新提供间隔", false)
 	serveFlagSet.DefineInt("dht-concurrency", "", 4, "DHT 提供并发数")
+	serveFlagSet.DefineString("discovery", "", "graphql-scan", "发现模式：sampling/graphql/graphql-scan", false)
+	serveFlagSet.DefineInt("min-height", "", 1919626, "最小扫描区块高度")
+	serveFlagSet.DefineInt("scan-batch", "", 100, "GraphQL 扫描批次大小")
+	serveFlagSet.DefineInt("scan-delay", "", 2000, "GraphQL 扫描查询延迟（毫秒）")
 
 	RootCommand.AddCommand(&Command{
 		Name:    "serve",
@@ -332,6 +336,10 @@ func RegisterCommands() {
 			dhtMode := serveFlagSet.GetString("dht-mode")
 			dhtReprovide := serveFlagSet.GetString("dht-reprovide")
 			dhtConcurrency := serveFlagSet.GetInt("dht-concurrency")
+			discoveryMode := serveFlagSet.GetString("discovery")
+			minHeight := serveFlagSet.GetInt("min-height")
+			scanBatch := serveFlagSet.GetInt("scan-batch")
+			scanDelayMs := serveFlagSet.GetInt("scan-delay")
 
 			if verbose {
 				config.ConfigFile.LogLevel = "debug"
@@ -347,6 +355,7 @@ func RegisterCommands() {
 			fmt.Printf("║ 网关地址:  %-20s ║\n", gateway)
 			fmt.Printf("║ 缓存目录:  %-20s ║\n", cacheDir)
 			fmt.Printf("║ DHT 发布:   %-20v ║\n", dhtEnabled)
+			fmt.Printf("║ 发现模式:  %-20s ║\n", discoveryMode)
 			fmt.Printf("╚══════════════════════════════════╝\n\n")
 
 			verifyPoW, verifyIndex, verifyRef, verifyIntegrity := config.ConfigFile.GetVerifyConfig()
@@ -360,6 +369,8 @@ func RegisterCommands() {
 				VerifyIndex:            verifyIndex,
 				VerifyReferenceChain:   verifyRef,
 				VerifyIntegrity:        verifyIntegrity,
+				DiscoveryMode:          discoveryMode,
+				MinBlockHeight:         uint64(minHeight),
 				CacheDir:               cacheDir,
 				MaxFileSize:            0,
 				CarAvailable:           !onlineVerify,
@@ -371,6 +382,8 @@ func RegisterCommands() {
 				DHTMode:                dhtMode,
 				DHTReprovideInterval:   dhtReprovide,
 				DHTProvideConcurrency:  dhtConcurrency,
+				ScanBatchSize:          scanBatch,
+				ScanQueryDelay:         time.Duration(scanDelayMs) * time.Millisecond,
 			}
 			if gateway != "" {
 				svcCfg.GatewayURLs = []string{gateway}

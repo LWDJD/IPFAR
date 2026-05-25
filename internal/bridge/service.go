@@ -38,7 +38,7 @@ type ServiceConfig struct {
 	VerifyIntegrity bool
 
 	// Discovery 发现配置
-	DiscoveryMode  string // "sampling"（默认）或 "graphql"
+	DiscoveryMode  string // "sampling"（随机游走）、"graphql"（GraphQL 单块查询）、"graphql-scan"（顺序扫描，默认）
 	MinBlockHeight uint64
 	MaxBlockHeight uint64
 	PollInterval   time.Duration
@@ -52,30 +52,34 @@ type ServiceConfig struct {
 	CarAvailable bool // 是否在验证前下载 CAR 到本地缓存（默认 true）
 
 	// 在线验证配置（路径 A：不存盘，Range 采样验证）
-	OnlineVerify          bool // 是否启用在线验证（默认 false）
-	OnlineSampleCount     int  // 在线验证采样 block 数量（默认 5）
-	OnlineMaxConcurrency  int  // 在线验证最大并发数（默认 4）
-	DownloadMaxConcurrency int  // 完整下载最大并发数（默认 2）
+	OnlineVerify          bool
+	OnlineSampleCount     int
+	OnlineMaxConcurrency  int
+	DownloadMaxConcurrency int
 
 	// DHT 内容发布配置（规范 P3-1）
-	DHTEnabled          bool     // 是否启用 DHT 内容发布
-	DHTMode             string   // DHT 模式: "server" / "client"
-	DHTBootstrapPeers   []string // DHT 引导节点
-	DHTReprovideInterval string   // 重新提供间隔
-	DHTProvideConcurrency int    // 提供并发数
-	DHTListenAddresses  []string // libp2p 监听地址
+	DHTEnabled          bool
+	DHTMode             string
+	DHTBootstrapPeers   []string
+	DHTReprovideInterval string
+	DHTProvideConcurrency int
+	DHTListenAddresses  []string
 
 	// Bitswap 按需拉取配置
-	BitswapEnabled bool   // 是否启用 Bitswap 服务
-	BitswapPort    int    // Bitswap 监听端口（默认 4001）
-	CacheSize      int64  // 缓存最大字节数（默认 1GB，用于 Bitswap 块缓存）
+	BitswapEnabled bool
+	BitswapPort    int
+	CacheSize      int64
+
+	// GraphQL 扫描配置（graphql-scan 模式）
+	ScanBatchSize  int           // 每批扫描块数（默认 100）
+	ScanQueryDelay time.Duration // 批次间延迟（默认 2s）
 }
 
 // DefaultServiceConfig 返回默认服务配置
 func DefaultServiceConfig() ServiceConfig {
 	return ServiceConfig{
 		Preset:                 pipeline.SecurityLight,
-		DiscoveryMode:          "graphql",
+		DiscoveryMode:          "graphql-scan", // 默认使用 GraphQL 顺序扫描
 		MinBlockHeight:         1919626,
 		MaxBlockHeight:         0, // 动态跟随
 		PollInterval:           2 * time.Minute,
@@ -89,6 +93,8 @@ func DefaultServiceConfig() ServiceConfig {
 		OnlineSampleCount:      5,
 		OnlineMaxConcurrency:   4,
 		DownloadMaxConcurrency: 2,
+		ScanBatchSize:          100,
+		ScanQueryDelay:         2 * time.Second,
 	}
 }
 
@@ -99,6 +105,10 @@ type Service struct {
 	fetcher *download.Fetcher
 	sampler *discovery.Sampler
 
+	// 新架构：GraphQL 顺序扫描 + 区块监听
+	graphQLScanner *discovery.GraphQLScanner
+	blockWatcher   *discovery.BlockWatcher
+
 	// DHT 内容发布提供器
 	dhtProvider *dht.Provider
 
@@ -108,7 +118,7 @@ type Service struct {
 
 	// Bitswap 按需拉取架构
 	bitswapService *bitswap.Service // Bitswap 服务端
-	indexStore     *index.Store     // CID → Arweave 索引
+	indexStore     *index.Store     // CID → Arweave 索引（两层）
 	blockFetcher   *BlockFetcher    // 按需拉取器
 	badgerDB       *badger.DB       // Badger 实例（复用）
 	cacheStore     *store.Store     // KV 存储（复用）
@@ -213,16 +223,27 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		}
 	}
 
+	// ============================================================
 	// 初始化 DHT Provider
+	// ============================================================
 	if cfg.DHTEnabled {
 		if err := svc.initDHTProvider(); err != nil {
 			log.Warn("桥接服务：DHT Provider 初始化失败（非致命）: %v", err)
 		}
 	}
 
-	// 根据 DiscoveryMode 创建对应的 BlockChecker
+	// ============================================================
+	// 根据 DiscoveryMode 创建相应的发现组件
+	// ============================================================
 	switch cfg.DiscoveryMode {
+	case "graphql-scan":
+		// 新：GraphQL 顺序扫描 + 区块监听
+		if err := svc.initGraphQLScan(cfg); err != nil {
+			log.Warn("桥接服务：GraphQL 扫描初始化失败: %v", err)
+		}
+		log.Info("桥接服务：发现模式 = graphql-scan（顺序扫描 + 新区块监听）")
 	case "graphql":
+		// 旧：单块 GraphQL 查询（通过采样器）
 		gwURL := "https://arweave.net"
 		if len(cfg.GatewayURLs) > 0 {
 			gwURL = cfg.GatewayURLs[0]
@@ -235,18 +256,81 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		}
 		graphqlChecker := discovery.NewGraphQLBlockChecker(checkerCfg)
 		svc.SetBlockChecker(graphqlChecker)
-		log.Info("桥接服务：发现模式 = graphql (网关: %s)", gwURL)
+		log.Info("桥接服务：发现模式 = graphql（单块查询，网关: %s）", gwURL)
 	case "sampling", "":
-		// 随机抽样模式：不预设 checker，由外部通过 SetBlockChecker 注入
-		log.Info("桥接服务：发现模式 = sampling（等待外部注入 BlockChecker）")
+		// 旧：随机抽样 + GraphQL 检查
+		gwURL := "https://arweave.net"
+		if len(cfg.GatewayURLs) > 0 {
+			gwURL = cfg.GatewayURLs[0]
+		}
+		checkerCfg := discovery.DefaultGraphQLCheckerConfig()
+		checkerCfg.GatewayURL = gwURL
+		checkerCfg.Timeout = cfg.PollInterval
+		if checkerCfg.Timeout <= 0 {
+			checkerCfg.Timeout = 30 * time.Second
+		}
+		blockChecker := discovery.NewGraphQLBlockChecker(checkerCfg)
+		svc.SetBlockChecker(blockChecker)
+		log.Info("桥接服务：发现模式 = sampling（随机抽样 + GraphQL 检查，网关: %s）", gwURL)
 	default:
-		log.Warn("桥接服务：未知发现模式 %q，使用 sampling 模式", cfg.DiscoveryMode)
+		log.Warn("桥接服务：未知发现模式 %q，使用 graphql-scan 模式", cfg.DiscoveryMode)
+		if err := svc.initGraphQLScan(cfg); err != nil {
+			log.Warn("桥接服务：GraphQL 扫描初始化失败: %v", err)
+		}
 	}
 
 	log.Info("桥接服务：初始化完成 preset=%s verify_pow=%v verify_index=%v verify_ref=%v verify_integrity=%v online_verify=%v dht=%v discovery=%s",
 		cfg.Preset, verifyPoW, verifyIndex, verifyRef, verifyIntegrity, cfg.OnlineVerify, cfg.DHTEnabled && svc.dhtProvider != nil, cfg.DiscoveryMode)
 
 	return svc, nil
+}
+
+// initGraphQLScan 初始化 GraphQL 顺序扫描 + 区块监听
+func (s *Service) initGraphQLScan(cfg ServiceConfig) error {
+	// 确保索引存储已创建
+	if s.indexStore == nil {
+		return fmt.Errorf("索引存储未初始化，请确保 Bitswap 已启用或手动创建索引")
+	}
+
+	gwURL := "https://arweave.net"
+	if len(cfg.GatewayURLs) > 0 {
+		gwURL = cfg.GatewayURLs[0]
+	}
+
+	// 1. 创建 GraphQL 顺序扫描器
+	scannerCfg := discovery.GraphQLScannerConfig{
+		GatewayURL: gwURL,
+		MinHeight:  cfg.MinBlockHeight,
+		MaxHeight:  cfg.MaxBlockHeight,
+		BatchSize:  cfg.ScanBatchSize,
+		QueryDelay: cfg.ScanQueryDelay,
+		Index:      s.indexStore,
+	}
+	if scannerCfg.BatchSize <= 0 {
+		scannerCfg.BatchSize = 100
+	}
+	if scannerCfg.QueryDelay <= 0 {
+		scannerCfg.QueryDelay = 2 * time.Second
+	}
+
+	var err error
+	s.graphQLScanner, err = discovery.NewGraphQLScanner(scannerCfg)
+	if err != nil {
+		return fmt.Errorf("创建 GraphQL 扫描器失败: %w", err)
+	}
+
+	// 2. 创建区块监听器
+	watcherCfg := discovery.BlockWatcherConfig{
+		GatewayURL:   gwURL,
+		PollInterval: 30 * time.Second,
+		Index:        s.indexStore,
+		Scanner:      s.graphQLScanner,
+	}
+	s.blockWatcher = discovery.NewBlockWatcher(watcherCfg)
+
+	log.Info("桥接服务：GraphQL 顺序扫描 + 区块监听已初始化 minHeight=%d batchSize=%d",
+		cfg.MinBlockHeight, scannerCfg.BatchSize)
+	return nil
 }
 
 // getOnlineVerifier 延迟初始化在线验证器（共享网关连接）
@@ -262,9 +346,6 @@ func (s *Service) getOnlineVerifier() *verify.OnlineVerifier {
 }
 
 // initDHTProvider 初始化 DHT 内容发布提供器
-//
-// 如果配置了 DHTListenAddresses，会自动创建 libp2p host 并启动 DHT Provider。
-// 否则只记录配置，由外部通过 SetDHTProvider 注入 Provider。
 func (s *Service) initDHTProvider() error {
 	cfg := dht.DefaultConfig()
 	cfg.Enabled = true
@@ -303,32 +384,15 @@ func (s *Service) initDHTProvider() error {
 	} else {
 		log.Info("桥接服务：DHT Provider 配置: mode=%s concurrency=%d reprovide=%s（等待外部注入 host）",
 			cfg.Mode, cfg.ProvideConcurrency, cfg.ReprovideInterval)
-		s.dhtProvider = nil // 由外部通过 SetDHTProvider 注入
+		s.dhtProvider = nil
 	}
 
 	return nil
 }
 
 // initBitswap 初始化 Bitswap 按需拉取架构
-//
-// 创建链路：Badger DB → index.Store → BlockFetcher → bitswap.Service
 func (s *Service) initBitswap(cfg ServiceConfig) error {
-	// 1. 创建 Badger DB（复用 store 配置）
-	badgerCfg := store.DefaultStoreConfig()
-	badgerCfg.Dir = cfg.CacheDir + "/badger"
-	s.badgerDB = nil // 延迟初始化，避免重复创建
-
-	// 如果已有 store 实例，复用其 Badger DB
-	if s.cacheStore == nil {
-		var err error
-		s.cacheStore, err = store.New(badgerCfg)
-		if err != nil {
-			return fmt.Errorf("创建 Badger 存储失败: %w", err)
-		}
-	}
-
-	// 使用 cacheStore 的底层 Badger DB（需要通过反射或导出方法获取）
-	// 暂时创建独立的 Badger 实例用于索引
+	// 1. 创建 Badger DB
 	indexBadgerCfg := badger.DefaultOptions(cfg.CacheDir + "/index")
 	indexBadgerCfg.MemTableSize = 16 << 20
 	indexBadgerCfg.NumMemtables = 2
@@ -343,14 +407,14 @@ func (s *Service) initBitswap(cfg ServiceConfig) error {
 	}
 	s.badgerDB = db
 
-	// 2. 创建索引存储
+	// 2. 创建两层索引存储
 	s.indexStore = index.NewStore(db)
-	log.Info("桥接服务：索引存储已初始化")
+	log.Info("桥接服务：两层索引存储已初始化")
 
 	// 3. 创建 Bitswap 块缓存
 	cacheSize := cfg.CacheSize
 	if cacheSize <= 0 {
-		cacheSize = 1 << 30 // 默认 1 GB
+		cacheSize = 1 << 30
 	}
 	blockCacheCfg := cache.CacheConfig{
 		Dir:     cfg.CacheDir + "/blocks",
@@ -377,7 +441,7 @@ func (s *Service) initBitswap(cfg ServiceConfig) error {
 		return fmt.Errorf("创建 BlockFetcher 失败: %w", err)
 	}
 
-	// 5. 创建 Bitswap 服务（端口被占用时自动 +1 重试）
+	// 5. 创建 Bitswap 服务
 	bitswapPort := cfg.BitswapPort
 	if bitswapPort <= 0 {
 		bitswapPort = 4001
@@ -428,7 +492,7 @@ func (s *Service) GetDHTProvider() *dht.Provider {
 	return s.dhtProvider
 }
 
-// Start 启动桥接服务（阻塞）
+// Start 启动桥接服务
 func (s *Service) Start() error {
 	log.Info("桥接服务：启动中...")
 	log.Info("  安全预设: %s", s.config.Preset)
@@ -449,14 +513,70 @@ func (s *Service) Start() error {
 	} else {
 		log.Info("  DHT 内容发布: 未启用")
 	}
-
-	// 启动发现采样器（如果配置了 checker）
-	if s.sampler != nil {
-		s.sampler.StartPolling()
+	if s.graphQLScanner != nil {
+		log.Info("  GraphQL 扫描: 已启用 (minHeight=%d)", s.config.MinBlockHeight)
+	}
+	if s.blockWatcher != nil {
+		log.Info("  区块监听: 已启用")
 	}
 
-	// 主循环
-	s.runMainLoop()
+	// ============================================================
+	// Bitswap 已在 New() 中自动启动监听（无需显式 Start）
+	// ============================================================
+	if s.bitswapService != nil {
+		log.Info("桥接服务：Bitswap 已启动，监听地址=%s", s.bitswapService.ListenAddr())
+	}
+
+	// ============================================================
+	// 启动 DHT Provider（已有）
+	// ============================================================
+	if s.dhtProvider != nil && !s.dhtProvider.IsStarted() {
+		if err := s.dhtProvider.Start(); err != nil {
+			log.Error("桥接服务：DHT Provider 启动失败: %v", err)
+		}
+	}
+
+	// ============================================================
+	// 启动 GraphQL 顺序扫描（新）—— 历史数据扫描
+	// ============================================================
+	if s.graphQLScanner != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			if err := s.graphQLScanner.Start(s.ctx); err != nil {
+				log.Error("桥接服务：GraphQL 扫描器启动失败: %v", err)
+			}
+		}()
+	}
+
+	// ============================================================
+	// 启动区块监听（新）—— 新区块发现
+	// ============================================================
+	if s.blockWatcher != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			if err := s.blockWatcher.Start(s.ctx); err != nil {
+				log.Error("桥接服务：区块监听器启动失败: %v", err)
+			}
+		}()
+	}
+
+	// ============================================================
+	// 旧模式兼容：启动采样器
+	// ============================================================
+	if s.sampler != nil {
+		s.sampler.StartPolling()
+		// 也运行主循环
+		s.runMainLoop()
+	} else if s.graphQLScanner != nil {
+		// 新模式下阻塞等待取消
+		log.Info("桥接服务：扫描/监听/发布/Bitswap 四大流程已启动，等待数据...")
+		<-s.ctx.Done()
+	} else {
+		log.Info("桥接服务：未配置发现模式，以被动模式运行")
+		<-s.ctx.Done()
+	}
 
 	return nil
 }
@@ -476,33 +596,50 @@ func (s *Service) StartAsync() {
 func (s *Service) Stop() {
 	log.Info("桥接服务：正在停止...")
 	s.cancel()
+
+	// 停止采样器
 	if s.sampler != nil {
 		s.sampler.Stop()
 	}
+
+	// 停止 GraphQL 扫描器
+	if s.graphQLScanner != nil {
+		s.graphQLScanner.Stop()
+	}
+
+	// 停止区块监听器
+	if s.blockWatcher != nil {
+		s.blockWatcher.Stop()
+	}
+
 	// 停止 Bitswap 服务
 	if s.bitswapService != nil {
 		if err := s.bitswapService.Close(); err != nil {
 			log.Warn("桥接服务：停止 Bitswap 失败: %v", err)
 		}
 	}
+
 	// 停止 DHT Provider
 	if s.dhtProvider != nil {
 		if err := s.dhtProvider.Stop(); err != nil {
 			log.Warn("桥接服务：停止 DHT Provider 失败: %v", err)
 		}
 	}
+
 	// 关闭 Badger 数据库
 	if s.badgerDB != nil {
 		if err := s.badgerDB.Close(); err != nil {
 			log.Warn("桥接服务：关闭 Badger 失败: %v", err)
 		}
 	}
+
 	// 关闭 KV 存储
 	if s.cacheStore != nil {
 		if err := s.cacheStore.Close(); err != nil {
 			log.Warn("桥接服务：关闭 KV 存储失败: %v", err)
 		}
 	}
+
 	s.wg.Wait()
 	log.Info("桥接服务：已停止")
 }
@@ -523,12 +660,10 @@ func (s *Service) SetBlockChecker(checker discovery.BlockChecker) {
 	s.sampler = discovery.NewSampler(cfg, checker)
 }
 
-// runMainLoop 运行主循环
+// runMainLoop 运行主循环（旧采样模式）
 func (s *Service) runMainLoop() {
-	// 如果没有配置采样器，运行一次后返回
 	if s.sampler == nil {
 		log.Info("桥接服务：未配置发现采样器，服务以被动模式运行")
-		// 阻塞直到取消
 		<-s.ctx.Done()
 		return
 	}
@@ -551,9 +686,8 @@ func (s *Service) runMainLoop() {
 	}
 }
 
-// pollAndProcess 轮询并处理发现的区块
+// pollAndProcess 轮询并处理发现的区块（旧采样模式）
 func (s *Service) pollAndProcess() {
-	// 随机抽样
 	result, err := s.sampler.Sample()
 	if err != nil {
 		log.Warn("桥接服务：抽样失败: %v", err)
@@ -581,7 +715,6 @@ func (s *Service) pollAndProcess() {
 
 	log.Info("桥接服务：发现数据区块 高度=%d 元数据交易数=%d", result.Height, len(result.MetadataTXIDs))
 
-	// 处理每个发现的元数据交易
 	for _, txID := range result.MetadataTXIDs {
 		if _, err := s.processMetadataTX(txID); err != nil {
 			log.Warn("桥接服务：处理元数据交易 %s 失败: %v", txID, err)
@@ -590,10 +723,6 @@ func (s *Service) pollAndProcess() {
 }
 
 // ProcessMetadataTX 手动处理一个元数据交易（公开接口）
-// 根据配置选择两条路径之一：
-//
-//	路径 A：在线验证（OnlineVerify=true）—— 不存盘，HTTP Range 采样验证
-//	路径 B：缓存到磁盘（CarAvailable=true）—— 下载完整 CAR 文件
 func (s *Service) ProcessMetadataTX(txID string) (*PipelineResult, error) {
 	return s.processMetadataTX(txID)
 }
@@ -613,22 +742,18 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 	s.mu.Unlock()
 
 	// Step 1.5: 如果是同 Bundle 模式，缓存 Bundle 原始数据
-	// 需要重新获取 Bundle 交易数据（包含所有 Items），并提取 CAR Item
 	if meta.IsSameBundle() {
 		s.cacheSameBundleData(txID, meta)
 	}
 
 	// ============================================================
-	// Bitswap 按需拉取路径：索引 CID，不下载完整 CAR
+	// Bitswap 按需拉取路径：使用两层索引
 	// ============================================================
-	if s.bitswapService != nil && s.indexStore != nil {
+	if s.indexStore != nil {
 		s.indexMetadataCIDs(txID, meta)
-		// Bitswap 模式：索引完成后，依赖 Bitswap 按需拉取
-		// 仍然运行快速验证（元数据 + PoW）
 	}
 
-	// 元数据已在 FetchMetadataByTXID 中校验过
-	// Step 2: 运行快速验证（元数据校验 + PoW）
+	// Step 2: 运行快速验证
 	quickResult := s.bridge.RunPipeline(meta, false)
 
 	if !quickResult.Passed {
@@ -654,16 +779,10 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 
 	// Step 3: 选择验证路径
 	if s.config.OnlineVerify && meta.DataTXID != "" {
-		// ====================
-		// 路径 A：在线验证（不存盘）
-		// ====================
 		return s.processOnlineVerify(meta, quickResult)
 	}
 
 	if s.config.CarAvailable {
-		// ====================
-		// 路径 B：完整下载 + 缓存
-		// ====================
 		return s.processFullDownload(meta, quickResult)
 	}
 
@@ -686,11 +805,10 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 	}, nil
 }
 
-// processOnlineVerify 路径 A：在线验证（HTTP Range 采样，不存盘）
+// processOnlineVerify 路径 A：在线验证
 func (s *Service) processOnlineVerify(meta *sdkmeta.Metadata, quickResult *pipeline.PipelineResult) (*PipelineResult, error) {
 	log.Info("桥接服务：路径 A（在线验证）data_txid=%s", meta.DataTXID)
 
-	// 获取并发信号量
 	s.onlineSema <- struct{}{}
 	defer func() { <-s.onlineSema }()
 
@@ -698,12 +816,10 @@ func (s *Service) processOnlineVerify(meta *sdkmeta.Metadata, quickResult *pipel
 	onlineResult, err := verifier.VerifyWithMeta(meta)
 	if err != nil {
 		log.Warn("桥接服务：在线验证失败 data_txid=%s: %v", meta.DataTXID, err)
-
 		s.mu.Lock()
 		s.stats.PipelinesFailed++
 		s.mu.Unlock()
 
-		// 在线验证失败，构建失败的结果
 		steps := append(quickResult.Results, pipeline.VerifyResult{
 			Step:    pipeline.StepIndex,
 			Passed:  false,
@@ -724,9 +840,7 @@ func (s *Service) processOnlineVerify(meta *sdkmeta.Metadata, quickResult *pipel
 	s.stats.OnlineVerified++
 	s.mu.Unlock()
 
-	// 将在线验证结果与快速验证结果合并
 	steps := quickResult.Results
-
 	indexStep := pipeline.VerifyResult{
 		Step:   pipeline.StepIndex,
 		Passed: onlineResult.Passed,
@@ -741,9 +855,7 @@ func (s *Service) processOnlineVerify(meta *sdkmeta.Metadata, quickResult *pipel
 	}
 	steps = append(steps, indexStep)
 
-	// 如果在线验证通过且配置了引用链或完整性验证，从在线验证获得的信息标记它们
 	if s.bridge.config.VerifyReferenceChain && meta.HasReference() {
-		// 引用链验证仍需完整数据或额外请求
 		steps = append(steps, pipeline.VerifyResult{
 			Step:    pipeline.StepReferenceChain,
 			Passed:  true,
@@ -752,7 +864,6 @@ func (s *Service) processOnlineVerify(meta *sdkmeta.Metadata, quickResult *pipel
 		})
 	}
 	if s.bridge.config.VerifyIntegrity {
-		// 完整性验证在在线模式下通过采样已部分覆盖
 		steps = append(steps, pipeline.VerifyResult{
 			Step:    pipeline.StepIntegrity,
 			Passed:  true,
@@ -785,18 +896,16 @@ func (s *Service) processOnlineVerify(meta *sdkmeta.Metadata, quickResult *pipel
 	}, nil
 }
 
-// processFullDownload 路径 B：完整下载 CAR 文件到本地缓存
+// processFullDownload 路径 B：完整下载 CAR 文件
 func (s *Service) processFullDownload(meta *sdkmeta.Metadata, quickResult *pipeline.PipelineResult) (*PipelineResult, error) {
 	log.Info("桥接服务：路径 B（完整下载）data_txid=%s", meta.DataTXID)
 
-	// 获取下载并发信号量
 	s.downloadSema <- struct{}{}
 	defer func() { <-s.downloadSema }()
 
 	carPath, err := s.fetcher.DownloadCAR(meta)
 	if err != nil {
 		log.Warn("桥接服务：CAR 下载失败 root_cid=%s: %v", meta.RootCID, err)
-		// 继续用快速验证结果
 		return &PipelineResult{
 			Meta:       meta,
 			Passed:     quickResult.Passed,
@@ -813,7 +922,7 @@ func (s *Service) processFullDownload(meta *sdkmeta.Metadata, quickResult *pipel
 
 	log.Info("桥接服务：CAR 文件已下载 root_cid=%s path=%s", meta.RootCID, carPath)
 
-	// DHT 内容发布：验证通过后发布 CID 到 DHT 网络
+	// DHT 内容发布
 	if s.dhtProvider != nil && s.dhtProvider.IsStarted() {
 		go func() {
 			rootCID, err := cid.Decode(meta.RootCID)
@@ -827,22 +936,18 @@ func (s *Service) processFullDownload(meta *sdkmeta.Metadata, quickResult *pipel
 		}()
 	}
 
-	// 运行完整验证管道（索引、引用链、完整性）
 	fullResult := s.bridge.RunPipeline(meta, true)
 
-	// 记录结果
 	if fullResult.Passed {
 		s.mu.Lock()
 		s.stats.PipelinesPassed++
 		s.mu.Unlock()
-
 		log.Info("桥接服务：验证管道通过 ✅ root_cid=%s steps=%d car=%s",
 			meta.RootCID, len(fullResult.Results), carPath)
 	} else {
 		s.mu.Lock()
 		s.stats.PipelinesFailed++
 		s.mu.Unlock()
-
 		log.Warn("桥接服务：验证管道失败 ❌ root_cid=%s", meta.RootCID)
 		for _, r := range fullResult.Results {
 			if !r.Passed && !r.Skipped {
@@ -851,9 +956,7 @@ func (s *Service) processFullDownload(meta *sdkmeta.Metadata, quickResult *pipel
 		}
 	}
 
-	// 清理缓存（可选）
 	if !fullResult.Passed && carPath != "" {
-		// 验证失败，清理 CAR 缓存
 		os.Remove(carPath)
 		carPath = ""
 	}
@@ -897,13 +1000,11 @@ func (s *Service) ProcessMetadataFromBase64(encoded string) (*PipelineResult, er
 
 // verifyMetadata 验证已解析的元数据（内部方法）
 func (s *Service) verifyMetadata(meta *sdkmeta.Metadata) (*PipelineResult, error) {
-	// 快速验证
 	quickResult := s.bridge.RunPipeline(meta, false)
 	if !quickResult.Passed {
 		s.mu.Lock()
 		s.stats.PipelinesFailed++
 		s.mu.Unlock()
-
 		return &PipelineResult{
 			Meta:       meta,
 			Passed:     false,
@@ -913,7 +1014,6 @@ func (s *Service) verifyMetadata(meta *sdkmeta.Metadata) (*PipelineResult, error
 		}, nil
 	}
 
-	// 选择验证路径
 	if s.config.OnlineVerify && meta.DataTXID != "" {
 		return s.processOnlineVerify(meta, quickResult)
 	}
@@ -922,7 +1022,6 @@ func (s *Service) verifyMetadata(meta *sdkmeta.Metadata) (*PipelineResult, error
 		return s.processFullDownload(meta, quickResult)
 	}
 
-	// 都不启用，仅快速验证
 	s.mu.Lock()
 	if quickResult.Passed {
 		s.stats.PipelinesPassed++
@@ -954,15 +1053,12 @@ func (s *Service) updateActivity() {
 	s.mu.Unlock()
 }
 
-// GetFetcher 获取下载器（用于外部访问）
+// GetFetcher 获取下载器
 func (s *Service) GetFetcher() *download.Fetcher {
 	return s.fetcher
 }
 
 // cacheSameBundleData 缓存同 Bundle 的 CAR 数据
-// 当 data_height = -1 且 bundle_txid = "none" 时，
-// 元数据和 CAR 文件在同一个 Bundle 内。
-// 此方法从 Bundle 交易中提取 CAR Item 的纯数据并缓存。
 func (s *Service) cacheSameBundleData(metadataTxID string, meta *sdkmeta.Metadata) {
 	gateway := s.fetcher.GetGateway()
 	if gateway == nil {
@@ -970,9 +1066,6 @@ func (s *Service) cacheSameBundleData(metadataTxID string, meta *sdkmeta.Metadat
 		return
 	}
 
-	// 获取 Bundle 原始数据
-	// metadataTxID 是元数据所在的交易 ID（可能是 Bundle TXID 或 Bundle Item ID）
-	// 这里简化处理：假设 metadataTxID 就是 Bundle TXID
 	_, rawData, err := gateway.FetchBundleItemByID(metadataTxID, meta.DataTXID)
 	if err != nil {
 		log.Warn("桥接服务：缓存同 Bundle 数据失败 bundle=%s item=%s: %v",
@@ -980,10 +1073,8 @@ func (s *Service) cacheSameBundleData(metadataTxID string, meta *sdkmeta.Metadat
 		return
 	}
 
-	// 缓存到 Fetcher（用于下载）
 	s.fetcher.CacheBundleRawData(meta.DataTXID, rawData)
 
-	// 同时缓存到 OnlineVerifier（用于在线验证）
 	if s.config.OnlineVerify {
 		s.getOnlineVerifier().SetBundleData(meta.DataTXID, rawData)
 	}
@@ -997,32 +1088,42 @@ func (s *Service) GetOnlineVerifier() *verify.OnlineVerifier {
 }
 
 // ============================================================
-// Bitswap 按需拉取：CID 索引
+// Bitswap 按需拉取：CID 索引（使用两层索引架构）
 // ============================================================
 
-// indexMetadataCIDs 将元数据中的 CID 信息写入索引
-//
-// 为 Bitswap 按需拉取做准备：
-//   - 索引 RootCID → Arweave 交易位置
-//   - 索引 Reference 中的 CID → 对应 Arweave 交易位置
+// indexMetadataCIDs 将元数据中的 CID 信息写入两层索引
 func (s *Service) indexMetadataCIDs(metadataTxID string, meta *sdkmeta.Metadata) {
 	if s.indexStore == nil {
 		return
 	}
 
-	// 索引 RootCID
-	rootEntry := &index.Entry{
-		CID:        meta.RootCID,
-		DataTXID:   meta.DataTXID,
-		BundleTXID: meta.BundleTXID,
-		Height:     int64(meta.DataHeight),
-		DataSize:   int64(meta.DataSize),
-		RawIndex:   nil, // 暂无 CAR Index
+	// 第二层：写入元数据索引
+	bundleTXID := meta.BundleTXID
+	if bundleTXID == "" {
+		bundleTXID = "none"
 	}
-	if err := s.indexStore.Put(rootEntry); err != nil {
-		log.Warn("桥接服务：索引 RootCID 失败 %s: %v", meta.RootCID, err)
+	params := map[string]string{
+		"dataTxId":    meta.DataTXID,
+		"bundleTxId":  bundleTXID,
+		"blockHeight": fmt.Sprintf("%d", meta.DataHeight),
+		"dataSize":    fmt.Sprintf("%d", meta.DataSize),
+		"rootCid":     meta.RootCID,
+		"verified":    "none",
+		"verifiedAt":  "0",
+	}
+	if err := s.indexStore.IndexMeta(metadataTxID, params); err != nil {
+		log.Warn("桥接服务：索引元数据失败 metaTxID=%s: %v", metadataTxID, err)
 	} else {
-		log.Debug("桥接服务：已索引 RootCID %s → tx=%s", meta.RootCID, meta.DataTXID)
+		log.Debug("桥接服务：已索引元数据 metaTxID=%s", metadataTxID)
+	}
+
+	// 第一层：索引 RootCID → metaTxID
+	if meta.RootCID != "" {
+		if err := s.indexStore.IndexCID(meta.RootCID, metadataTxID); err != nil {
+			log.Warn("桥接服务：索引 RootCID 失败 %s: %v", meta.RootCID, err)
+		} else {
+			log.Debug("桥接服务：已索引 CID %s → metaTxID=%s", meta.RootCID, metadataTxID)
+		}
 	}
 
 	// 索引 Reference 中的 CID
@@ -1030,15 +1131,7 @@ func (s *Service) indexMetadataCIDs(metadataTxID string, meta *sdkmeta.Metadata)
 		refMap := *meta.Reference
 		for refTXID, entry := range refMap {
 			for _, cidStr := range entry.CIDs {
-				refEntry := &index.Entry{
-					CID:        cidStr,
-					DataTXID:   refTXID,
-					BundleTXID: entry.BundleTXID,
-					Height:     int64(entry.Height),
-					DataSize:   0, // 引用条目不记录大小
-					RawIndex:   nil,
-				}
-				if err := s.indexStore.Put(refEntry); err != nil {
+				if err := s.indexStore.IndexCID(cidStr, refTXID); err != nil {
 					log.Warn("桥接服务：索引引用 CID 失败 %s: %v", cidStr, err)
 				} else {
 					log.Debug("桥接服务：已索引引用 CID %s → tx=%s", cidStr, refTXID)
@@ -1047,7 +1140,7 @@ func (s *Service) indexMetadataCIDs(metadataTxID string, meta *sdkmeta.Metadata)
 		}
 	}
 
-	log.Info("桥接服务：CID 索引完成 root=%s", meta.RootCID)
+	log.Info("桥接服务：两层索引完成 root=%s meta=%s", meta.RootCID, metadataTxID)
 }
 
 // ============================================================
@@ -1069,8 +1162,17 @@ func (s *Service) GetBlockFetcher() *BlockFetcher {
 	return s.blockFetcher
 }
 
-// SetBadgerDB 注入外部 Badger DB（用于共享存储）
-// 在 initBitswap 之前调用以复用一个 Badger 实例
+// GetGraphQLScanner 获取 GraphQL 扫描器
+func (s *Service) GetGraphQLScanner() *discovery.GraphQLScanner {
+	return s.graphQLScanner
+}
+
+// GetBlockWatcher 获取区块监听器
+func (s *Service) GetBlockWatcher() *discovery.BlockWatcher {
+	return s.blockWatcher
+}
+
+// SetBadgerDB 注入外部 Badger DB
 func (s *Service) SetBadgerDB(db *badger.DB) {
 	s.badgerDB = db
 }
@@ -1086,12 +1188,12 @@ func (s *Service) SetKVStore(kvStore *store.Store) {
 
 // PipelineResult 管道处理结果（扩展版）
 type PipelineResult struct {
-	Meta       *sdkmeta.Metadata            `json:"meta"`
-	Passed     bool                         `json:"passed"`
-	Steps      []pipeline.VerifyResult      `json:"steps"`
-	CARPath    string                       `json:"car_path,omitempty"`
-	QuickOnly  bool                         `json:"quick_only,omitempty"`
-	VerifyMode string                       `json:"verify_mode,omitempty"` // "quick", "online", "download"
+	Meta       *sdkmeta.Metadata       `json:"meta"`
+	Passed     bool                    `json:"passed"`
+	Steps      []pipeline.VerifyResult `json:"steps"`
+	CARPath    string                  `json:"car_path,omitempty"`
+	QuickOnly  bool                    `json:"quick_only,omitempty"`
+	VerifyMode string                  `json:"verify_mode,omitempty"`
 }
 
 // FormatResult 格式化管道结果为可读字符串
