@@ -1,6 +1,7 @@
 package config
 
 import (
+	"github.com/LWDJD/ipfar-sdk/verify/pipeline"
 	"github.com/leonelquinteros/gotext"
 	"github.com/lwdjd/IPFAR/internal/log"
 )
@@ -116,12 +117,22 @@ func InitLog() error {
 	return nil
 }
 
+// DefaultVerifyConfig 返回默认验证配置（与 pipeline.SecurityLight 一致）
+func DefaultVerifyConfig() pipeline.VerifyConfig {
+	return pipeline.VerifyConfig{
+		VerifyPoW:            true,
+		VerifyIndex:          true, // spec §3.4: Index always enforced
+		VerifyReferenceChain: true,
+		VerifyIntegrity:      false,
+	}
+}
+
 // GetVerifyConfig 从配置中获取验证配置
 // 如果设置了 security_preset，则使用预设值覆盖单独选项
 func (c *Config) GetVerifyConfig() (verifyPoW, verifyIndex, verifyRef, verifyIntegrity bool) {
 	// 默认值：light 模式
 	if c.SecurityPreset == "" && !c.VerifyPoW && !c.VerifyIndex && !c.VerifyReferenceChain && !c.VerifyIntegrity {
-		return true, false, true, false // light: PoW + Ref chain
+		return true, true, true, false // light: PoW + Index + Ref chain（与 pipeline.SecurityLight 一致）
 	}
 
 	switch c.SecurityPreset {

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	sdkArweave "github.com/LWDJD/ipfar-sdk/arweave"
 	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
 	"github.com/LWDJD/ipfar-sdk/verify/pipeline"
 	"github.com/dgraph-io/badger/v4"
@@ -95,6 +96,41 @@ func DefaultServiceConfig() ServiceConfig {
 		DownloadMaxConcurrency: 2,
 		ScanBatchSize:          100,
 		ScanQueryDelay:         2 * time.Second,
+	}
+}
+
+// getVerifyConfig 从 ServiceConfig 中获取 pipeline.VerifyConfig
+// 默认值与 pipeline.SecurityLight 一致：Index=true
+func (c *ServiceConfig) getVerifyConfig() pipeline.VerifyConfig {
+	verifyPoW := c.VerifyPoW
+	verifyIndex := c.VerifyIndex
+	verifyRef := c.VerifyReferenceChain
+	verifyIntegrity := c.VerifyIntegrity
+
+	// 如果设置了 preset，优先使用 preset
+	if c.Preset != "" {
+		presetConfig, err := pipeline.GetPreset(c.Preset)
+		if err == nil {
+			// 只有在独立开关未显式设置时才使用 preset
+			if !c.VerifyPoW && !c.VerifyIndex && !c.VerifyReferenceChain && !c.VerifyIntegrity {
+				verifyPoW = presetConfig.VerifyPoW
+				verifyIndex = presetConfig.VerifyIndex
+				verifyRef = presetConfig.VerifyReferenceChain
+				verifyIntegrity = presetConfig.VerifyIntegrity
+			}
+		}
+	}
+
+	// spec §3.4: Index always enforced — 至少保证 Index=true
+	if !verifyIndex {
+		verifyIndex = true
+	}
+
+	return pipeline.VerifyConfig{
+		VerifyPoW:            verifyPoW,
+		VerifyIndex:          verifyIndex,
+		VerifyReferenceChain: verifyRef,
+		VerifyIntegrity:      verifyIntegrity,
 	}
 }
 
@@ -188,6 +224,45 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		})
 	}
 	fetcher := download.NewFetcher(dlCfg)
+
+	// M5: 对配置的网关执行健康检查，不可用的自动跳过
+	if len(cfg.GatewayURLs) > 0 && fetcher.GetGateway() != nil {
+		healthyURLs := make([]string, 0, len(cfg.GatewayURLs))
+		for _, gwURL := range cfg.GatewayURLs {
+			client := sdkArweave.NewGatewayClient(gwURL)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := client.CheckHealth(ctx)
+			cancel()
+			if err != nil {
+				log.Warn("桥接服务：网关健康检查失败 %s: %v，跳过此网关", gwURL, err)
+			} else {
+				log.Info("桥接服务：网关健康检查通过 %s", gwURL)
+				healthyURLs = append(healthyURLs, gwURL)
+			}
+		}
+		if len(healthyURLs) == 0 {
+			log.Warn("桥接服务：所有网关健康检查均失败，使用默认网关列表")
+			healthyURLs = []string{"https://arweave.net"}
+		}
+		// 更新 fetcher 网关配置
+		cfg.GatewayURLs = healthyURLs
+	}
+
+	// B5: 注入 GatewayClient 到 Bridge（用于引用链验证等网络操作）
+	if fetcher.GetGateway() != nil {
+		// 获取底层 SDK GatewayClient（单网关，取第一个）
+		gw := fetcher.GetGateway()
+		if gw != nil && gw.MultiGatewayClient != nil {
+			// 创建单网关的 GatewayClient 用于 pipeline 引用链验证
+			// 使用 fetcher 内置网关的第一个 URL
+			gwURLs := cfg.GatewayURLs
+			if len(gwURLs) == 0 {
+				gwURLs = []string{"https://arweave.net"}
+			}
+			sdkClient := sdkArweave.NewGatewayClient(gwURLs[0])
+			bridge.SetGatewayClient(sdkClient)
+		}
+	}
 
 	// 并发控制信号量
 	downloadMax := cfg.DownloadMaxConcurrency
@@ -731,6 +806,20 @@ func (s *Service) ProcessMetadataTX(txID string) (*PipelineResult, error) {
 func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 	log.Info("桥接服务：处理元数据交易 %s", txID)
 
+	// Step 0: 验证缓存检查（M2）
+	if s.indexStore != nil {
+		// 检查是否已验证过（light 级别）
+		if verified, _ := s.indexStore.IsVerified(txID, "light"); verified {
+			log.Info("桥接服务：元数据已通过 light 验证，跳过 pipeline 验证 txID=%s", txID)
+			return &PipelineResult{
+				Meta:       nil,
+				Passed:     true,
+				QuickOnly:  true,
+				VerifyMode: "cached",
+			}, nil
+		}
+	}
+
 	// Step 1: 获取元数据
 	meta, err := s.fetcher.FetchMetadataByTXID(txID)
 	if err != nil {
@@ -770,6 +859,7 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 		return &PipelineResult{
 			Meta:       meta,
 			Passed:     false,
+			Incomplete: quickResult.Incomplete,
 			Steps:      quickResult.Results,
 			CARPath:    "",
 			QuickOnly:  true,
@@ -778,31 +868,40 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 	}
 
 	// Step 3: 选择验证路径
+	var result *PipelineResult
 	if s.config.OnlineVerify && meta.DataTXID != "" {
-		return s.processOnlineVerify(meta, quickResult)
-	}
-
-	if s.config.CarAvailable {
-		return s.processFullDownload(meta, quickResult)
-	}
-
-	// 两条路径都未启用，仅返回快速验证结果
-	s.mu.Lock()
-	if quickResult.Passed {
-		s.stats.PipelinesPassed++
+		result, _ = s.processOnlineVerify(meta, quickResult)
+	} else if s.config.CarAvailable {
+		result, _ = s.processFullDownload(meta, quickResult)
 	} else {
-		s.stats.PipelinesFailed++
-	}
-	s.mu.Unlock()
+		// 两条路径都未启用，仅返回快速验证结果
+		s.mu.Lock()
+		if quickResult.Passed {
+			s.stats.PipelinesPassed++
+		} else {
+			s.stats.PipelinesFailed++
+		}
+		s.mu.Unlock()
 
-	return &PipelineResult{
-		Meta:       meta,
-		Passed:     quickResult.Passed,
-		Steps:      quickResult.Results,
-		CARPath:    "",
-		QuickOnly:  true,
-		VerifyMode: "quick",
-	}, nil
+		result = &PipelineResult{
+			Meta:       meta,
+			Passed:     quickResult.Passed,
+			Incomplete: quickResult.Incomplete,
+			Steps:      quickResult.Results,
+			CARPath:    "",
+			QuickOnly:  true,
+			VerifyMode: "quick",
+		}
+	}
+
+	// M2: 验证通过后标记已验证
+	if result != nil && result.Passed && s.indexStore != nil {
+		if err := s.indexStore.MarkVerified(txID, "light"); err != nil {
+			log.Warn("桥接服务：标记已验证失败 txID=%s: %v", txID, err)
+		}
+	}
+
+	return result, nil
 }
 
 // processOnlineVerify 路径 A：在线验证
@@ -830,6 +929,7 @@ func (s *Service) processOnlineVerify(meta *sdkmeta.Metadata, quickResult *pipel
 		return &PipelineResult{
 			Meta:       meta,
 			Passed:     false,
+			Incomplete: quickResult.Incomplete,
 			Steps:      steps,
 			CARPath:    "",
 			VerifyMode: "online",
@@ -855,14 +955,30 @@ func (s *Service) processOnlineVerify(meta *sdkmeta.Metadata, quickResult *pipel
 	}
 	steps = append(steps, indexStep)
 
+	// B5: 在线验证路径中的引用链验证（不再硬编码跳过）
+	incomplete := quickResult.Incomplete
 	if s.bridge.config.VerifyReferenceChain && meta.HasReference() {
-		steps = append(steps, pipeline.VerifyResult{
-			Step:    pipeline.StepReferenceChain,
-			Passed:  true,
-			Skipped: true,
-			Message: "在线验证模式下引用链验证待实现",
-		})
+		refVR := s.verifyReferenceChainOnline(meta)
+		steps = append(steps, refVR)
+		if refVR.Incomplete {
+			incomplete = true
+		}
+		if !refVR.Passed && !refVR.Skipped {
+			// 引用链硬失败
+			s.mu.Lock()
+			s.stats.PipelinesFailed++
+			s.mu.Unlock()
+			return &PipelineResult{
+				Meta:       meta,
+				Passed:     false,
+				Incomplete: incomplete,
+				Steps:      steps,
+				CARPath:    "",
+				VerifyMode: "online",
+			}, nil
+		}
 	}
+
 	if s.bridge.config.VerifyIntegrity {
 		steps = append(steps, pipeline.VerifyResult{
 			Step:    pipeline.StepIntegrity,
@@ -887,13 +1003,76 @@ func (s *Service) processOnlineVerify(meta *sdkmeta.Metadata, quickResult *pipel
 		log.Warn("桥接服务：在线验证失败 ❌ root_cid=%s", meta.RootCID)
 	}
 
+	// M4: DHT 发布（在线验证路径也触发）
+	s.dhtProvideCID(meta.RootCID)
+
 	return &PipelineResult{
 		Meta:       meta,
 		Passed:     finalPassed,
+		Incomplete: incomplete,
 		Steps:      steps,
 		CARPath:    "",
 		VerifyMode: "online",
 	}, nil
+}
+
+// verifyReferenceChainOnline 在线验证路径中的引用链验证
+// 使用 SDK pipeline 的引用链验证器（通过 GatewayClient 下载数据）
+func (s *Service) verifyReferenceChainOnline(meta *sdkmeta.Metadata) pipeline.VerifyResult {
+	// 创建独立的 pipeline 实例进行引用链验证
+	refPipeline := pipeline.NewPipeline(s.bridge.config)
+	if s.bridge.GetGatewayClient() != nil {
+		refPipeline.SetGatewayClient(s.bridge.GetGatewayClient())
+	} else {
+		return pipeline.VerifyResult{
+			Step:    pipeline.StepReferenceChain,
+			Passed:  true,
+			Skipped: true,
+			Message: "在线验证模式下网关客户端不可用，引用链验证跳过",
+		}
+	}
+
+	// 使用 executeStepWithIncomplete 模式执行引用链验证
+	// 直接调用 pipeline 的引用验证器
+	err := refPipeline.VerifyReferenceChain(meta)
+	if err != nil {
+		// 检查是否为不完整错误
+		if refErr, ok := err.(*pipeline.ReferenceIncompleteError); ok {
+			return pipeline.VerifyResult{
+				Step:       pipeline.StepReferenceChain,
+				Passed:     true,
+				Incomplete: true,
+				Message:    fmt.Sprintf("引用链不完整: %v", refErr),
+			}
+		}
+		return pipeline.VerifyResult{
+			Step:   pipeline.StepReferenceChain,
+			Passed: false,
+			Error:  fmt.Sprintf("引用链验证失败: %v", err),
+		}
+	}
+
+	return pipeline.VerifyResult{
+		Step:    pipeline.StepReferenceChain,
+		Passed:  true,
+		Message: "引用链验证通过",
+	}
+}
+
+// dhtProvideCID 统一 DHT 内容发布（M4）
+func (s *Service) dhtProvideCID(rootCIDStr string) {
+	if s.dhtProvider != nil && s.dhtProvider.IsStarted() && rootCIDStr != "" {
+		go func() {
+			rootCID, err := cid.Decode(rootCIDStr)
+			if err != nil {
+				log.Warn("桥接服务：无法解析 RootCID %q 为 CID: %v", rootCIDStr, err)
+				return
+			}
+			if err := s.dhtProvider.Provide(rootCID); err != nil {
+				log.Warn("桥接服务：DHT Provide 失败 %s: %v", rootCIDStr, err)
+			}
+		}()
+	}
 }
 
 // processFullDownload 路径 B：完整下载 CAR 文件
@@ -909,6 +1088,7 @@ func (s *Service) processFullDownload(meta *sdkmeta.Metadata, quickResult *pipel
 		return &PipelineResult{
 			Meta:       meta,
 			Passed:     quickResult.Passed,
+			Incomplete: quickResult.Incomplete,
 			Steps:      quickResult.Results,
 			CARPath:    "",
 			QuickOnly:  true,
@@ -922,19 +1102,8 @@ func (s *Service) processFullDownload(meta *sdkmeta.Metadata, quickResult *pipel
 
 	log.Info("桥接服务：CAR 文件已下载 root_cid=%s path=%s", meta.RootCID, carPath)
 
-	// DHT 内容发布
-	if s.dhtProvider != nil && s.dhtProvider.IsStarted() {
-		go func() {
-			rootCID, err := cid.Decode(meta.RootCID)
-			if err != nil {
-				log.Warn("桥接服务：无法解析 RootCID %q 为 CID: %v", meta.RootCID, err)
-				return
-			}
-			if err := s.dhtProvider.Provide(rootCID); err != nil {
-				log.Warn("桥接服务：DHT Provide 失败 %s: %v", meta.RootCID, err)
-			}
-		}()
-	}
+	// M4: DHT 内容发布（完整下载路径）
+	s.dhtProvideCID(meta.RootCID)
 
 	fullResult := s.bridge.RunPipeline(meta, true)
 
@@ -964,6 +1133,7 @@ func (s *Service) processFullDownload(meta *sdkmeta.Metadata, quickResult *pipel
 	return &PipelineResult{
 		Meta:       meta,
 		Passed:     fullResult.Passed,
+		Incomplete: fullResult.Incomplete,
 		Steps:      fullResult.Results,
 		CARPath:    carPath,
 		VerifyMode: "download",
@@ -1008,6 +1178,7 @@ func (s *Service) verifyMetadata(meta *sdkmeta.Metadata) (*PipelineResult, error
 		return &PipelineResult{
 			Meta:       meta,
 			Passed:     false,
+			Incomplete: quickResult.Incomplete,
 			Steps:      quickResult.Results,
 			QuickOnly:  true,
 			VerifyMode: "quick",
@@ -1033,6 +1204,7 @@ func (s *Service) verifyMetadata(meta *sdkmeta.Metadata) (*PipelineResult, error
 	return &PipelineResult{
 		Meta:       meta,
 		Passed:     quickResult.Passed,
+		Incomplete: quickResult.Incomplete,
 		Steps:      quickResult.Results,
 		QuickOnly:  true,
 		VerifyMode: "quick",
@@ -1190,6 +1362,7 @@ func (s *Service) SetKVStore(kvStore *store.Store) {
 type PipelineResult struct {
 	Meta       *sdkmeta.Metadata       `json:"meta"`
 	Passed     bool                    `json:"passed"`
+	Incomplete bool                    `json:"incomplete,omitempty"` // 引用链不完整标记
 	Steps      []pipeline.VerifyResult `json:"steps"`
 	CARPath    string                  `json:"car_path,omitempty"`
 	QuickOnly  bool                    `json:"quick_only,omitempty"`
@@ -1207,6 +1380,10 @@ func FormatResult(result *PipelineResult) string {
 		status = "❌ 失败"
 	}
 
+	if result.Incomplete {
+		status += " ⚠️ 不完整"
+	}
+
 	modeLabel := ""
 	switch result.VerifyMode {
 	case "online":
@@ -1215,6 +1392,8 @@ func FormatResult(result *PipelineResult) string {
 		modeLabel = " (完整下载)"
 	case "quick":
 		modeLabel = " (仅快速验证)"
+	case "cached":
+		modeLabel = " (缓存命中)"
 	}
 
 	output := fmt.Sprintf("验证结果: %s%s\n", status, modeLabel)
@@ -1238,10 +1417,14 @@ func FormatResult(result *PipelineResult) string {
 			icon = "❌"
 		} else if step.Skipped {
 			icon = "⏭️"
+		} else if step.Incomplete {
+			icon = "⚠️"
 		}
 		output += fmt.Sprintf("  %s %s", icon, step.Step)
 		if step.Skipped {
 			output += fmt.Sprintf(" (跳过: %s)", step.Message)
+		} else if step.Incomplete {
+			output += fmt.Sprintf(" (不完整: %s)", step.Message)
 		} else if !step.Passed {
 			output += fmt.Sprintf(" (失败: %s)", step.Error)
 		} else if step.Message != "" {
