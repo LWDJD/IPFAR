@@ -46,6 +46,11 @@ func (b *Bridge) SetGatewayClient(client *arweave.GatewayClient) {
 	b.gatewayClient = client
 }
 
+// GetGatewayClient 获取 Arweave 网关客户端。
+func (b *Bridge) GetGatewayClient() *arweave.GatewayClient {
+	return b.gatewayClient
+}
+
 // VerifyMetadata 验证元数据 JSON
 // 解析并验证元数据的合法性（必填字段、类型、条件字段等）
 func (b *Bridge) VerifyMetadata(jsonData []byte) (*metadata.Metadata, error) {
