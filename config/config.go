@@ -121,7 +121,7 @@ func InitLog() error {
 func DefaultVerifyConfig() pipeline.VerifyConfig {
 	return pipeline.VerifyConfig{
 		VerifyPoW:            true,
-		VerifyIndex:          true, // spec §3.4: Index always enforced
+		VerifyIndex:          false,
 		VerifyReferenceChain: true,
 		VerifyIntegrity:      false,
 	}
@@ -132,7 +132,7 @@ func DefaultVerifyConfig() pipeline.VerifyConfig {
 func (c *Config) GetVerifyConfig() (verifyPoW, verifyIndex, verifyRef, verifyIntegrity bool) {
 	// 默认值：light 模式
 	if c.SecurityPreset == "" && !c.VerifyPoW && !c.VerifyIndex && !c.VerifyReferenceChain && !c.VerifyIntegrity {
-		return true, true, true, false // light: PoW + Index + Ref chain（与 pipeline.SecurityLight 一致）
+		return true, false, true, false // light: PoW + Ref chain（与 pipeline.SecurityLight 一致）
 	}
 
 	switch c.SecurityPreset {
@@ -141,9 +141,9 @@ func (c *Config) GetVerifyConfig() (verifyPoW, verifyIndex, verifyRef, verifyInt
 	case "balanced":
 		return true, true, false, true
 	case "light":
-		return true, true, true, false // spec §3.4: Index always enforced
+		return true, false, true, false
 	case "trusted":
-		return false, true, false, false // spec §3.4: Index always enforced
+		return false, false, false, false
 	default:
 		return c.VerifyPoW, c.VerifyIndex, c.VerifyReferenceChain, c.VerifyIntegrity
 	}

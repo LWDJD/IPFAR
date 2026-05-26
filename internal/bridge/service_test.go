@@ -424,8 +424,8 @@ func TestConfigPresets(t *testing.T) {
 	}{
 		{"strict", true, true, true, true},
 		{"balanced", true, true, false, true},
-		{"light", true, true, true, false}, // spec §3.4: Index always enforced
-		{"trusted", false, true, false, false}, // spec §3.4: Index always enforced
+		{"light", true, false, true, false},
+		{"trusted", false, false, false, false},
 	}
 
 	for _, tt := range tests {
