@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNewCache(t *testing.T) {
@@ -183,21 +184,40 @@ func TestLRUEviction(t *testing.T) {
 		t.Errorf("CurrentSize %d 应接近 MaxSize %d", stats.CurrentSize, maxSize)
 	}
 
-	// 访问 key1 使其成为最近使用
+	// 手动过期所有条目的 LastAccess，使驱逐可以发生
+	// （因为 10 分钟保护期在单元测试中不现实）
+	oldTime := time.Now().Add(-20 * time.Minute)
+	c.mu.Lock()
+	for _, entry := range c.entries {
+		entry.LastAccess = oldTime
+	}
+	c.mu.Unlock()
+
+	// 访问 key1 使其成为最近使用（同时刷新其 LastAccess）
 	_, ok, _ := c.Get("key1")
 	if !ok {
 		t.Fatal("key1 应存在")
 	}
 
-	// 写入 key4（300 字节），应触发淘汰（可能淘汰 key2 或 key3）
+	// 再次过期 key2 和 key3 的 LastAccess（key1 的 LastAccess 被 Get 刷新了）
+	c.mu.Lock()
+	if e, ok := c.entries["key2"]; ok {
+		e.LastAccess = oldTime
+	}
+	if e, ok := c.entries["key3"]; ok {
+		e.LastAccess = oldTime
+	}
+	c.mu.Unlock()
+
+	// 写入 key4（300 字节），应触发淘汰 key2 或 key3（key1 受保护）
 	if err := c.Put("key4", data); err != nil {
 		t.Fatalf("Put key4 不应返回错误: %v", err)
 	}
 
-	// key1 应还在（被访问过）
+	// key1 应还在（被访问过 → 保护期刷新 → 不可驱逐）
 	_, ok, _ = c.Get("key1")
 	if !ok {
-		t.Error("key1 应未被淘汰（最近访问过）")
+		t.Error("key1 应未被淘汰（最近访问过，仍在保护期内）")
 	}
 
 	// 至少有一个较早的 key 被淘汰
