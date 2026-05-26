@@ -244,7 +244,7 @@ func (w *BlockWatcher) checkNewBlocks(fromHeight, toHeight uint64) ([]string, er
 func (w *BlockWatcher) processBlockMeta(txID string, blockHeight uint64) error {
 	// 检查是否已处理
 	if w.index != nil {
-		if verified, _ := w.index.IsVerified(txID, "light"); verified {
+		if verified, _ := w.index.IsVerified(txID); verified {
 			log.Debug("区块监听器：元数据已通过 light 验证，跳过 %s", txID)
 			return nil
 		}
@@ -318,7 +318,7 @@ func (w *BlockWatcher) processBlockMeta(txID string, blockHeight uint64) error {
 	}
 
 	// B4: 调用 MarkVerified() 标记验证状态
-	if err := w.index.MarkVerified(txID, "light"); err != nil {
+	if err := w.index.MarkVerified(txID); err != nil {
 		log.Warn("区块监听器：标记已验证失败 %s: %v", txID, err)
 	}
 

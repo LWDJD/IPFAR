@@ -38,14 +38,6 @@ const (
 	StepMetaValidate = "meta_validate" // 强制，但也可以缓存
 )
 
-// 安全级别常量
-const (
-	LevelStrict   = "strict"
-	LevelBalanced = "balanced"
-	LevelLight    = "light"
-	LevelTrusted  = "trusted"
-)
-
 // 键前缀常量
 const (
 	prefixCID      = "cid:" // CID 索引键前缀
@@ -270,43 +262,40 @@ func (s *Store) GetMeta(metaTxID string) (map[string]string, error) {
 // ============================================================
 // 按步骤验证缓存
 // ============================================================
-
-// （MarkVerified / IsVerified 便捷方法在按步骤方法之后定义，见下方）
+//
+// 验证缓存按步骤存储，不区分安全级别（级别只决定跑哪些步骤，
+// 步骤验过了就是验过了，不需要区分级别）。
+//
+// Badger key 格式: "v:" + metaTxID + ":" + step → "true"
 
 // buildStepKey 构建按步骤验证的 Badger 键
-// 格式: "v:" + level + ":" + metaTxID + ":" + step
-func buildStepKey(level, metaTxID, step string) string {
-	return prefixVerified + level + ":" + metaTxID + ":" + step
+// 格式: "v:" + metaTxID + ":" + step
+func buildStepKey(metaTxID, step string) string {
+	return prefixVerified + metaTxID + ":" + step
 }
 
-// MarkStepVerifiedAtLevel 在特定安全级别下标记某步骤已验证通过
-func (s *Store) MarkStepVerifiedAtLevel(metaTxID, step, level string) error {
+// MarkStepVerified 标记某一步骤已验证通过
+func (s *Store) MarkStepVerified(metaTxID, step string) error {
 	if metaTxID == "" {
 		return fmt.Errorf("index: metaTxID must not be empty")
 	}
 	if step == "" {
 		return fmt.Errorf("index: step must not be empty")
 	}
-	if level == "" {
-		level = LevelLight
-	}
 
-	key := []byte(buildStepKey(level, metaTxID, step))
+	key := []byte(buildStepKey(metaTxID, step))
 	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(key, []byte("true"))
 	})
 }
 
-// IsStepVerifiedAtLevel 检查特定级别下某步骤是否已验证通过
-func (s *Store) IsStepVerifiedAtLevel(metaTxID, step, level string) (bool, error) {
+// IsStepVerified 检查某一步骤是否已验证通过
+func (s *Store) IsStepVerified(metaTxID, step string) (bool, error) {
 	if metaTxID == "" || step == "" {
 		return false, nil
 	}
-	if level == "" {
-		level = LevelLight
-	}
 
-	key := []byte(buildStepKey(level, metaTxID, step))
+	key := []byte(buildStepKey(metaTxID, step))
 	found := false
 	err := s.db.View(func(txn *badger.Txn) error {
 		_, err := txn.Get(key)
@@ -322,48 +311,29 @@ func (s *Store) IsStepVerifiedAtLevel(metaTxID, step, level string) (bool, error
 	return found, err
 }
 
-// MarkStepVerified 标记某一步骤已验证通过（默认 light 级别）
-func (s *Store) MarkStepVerified(metaTxID, step string) error {
-	return s.MarkStepVerifiedAtLevel(metaTxID, step, LevelLight)
-}
-
-// IsStepVerified 检查某一步骤是否已验证通过（默认 light 级别）
-func (s *Store) IsStepVerified(metaTxID, step string) (bool, error) {
-	return s.IsStepVerifiedAtLevel(metaTxID, step, LevelLight)
-}
-
-// GetVerifiedSteps 获取某元数据所有已验证通过的步骤列表（所有级别）
+// GetVerifiedSteps 获取某元数据所有已验证的步骤
 func (s *Store) GetVerifiedSteps(metaTxID string) ([]string, error) {
 	if metaTxID == "" {
 		return nil, nil
 	}
 
 	var steps []string
-	seen := make(map[string]bool)
-
 	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		prefix := []byte(prefixVerified)
+		// 前缀: "v:metaTxID:"
+		prefix := []byte(prefixVerified + metaTxID + ":")
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			item := it.Item()
 			key := string(item.Key())
-			// 键格式: "v:level:metaTxID:step"
-			// 去掉前缀 "v:" 后按 ":" 分割
-			rest := key[len(prefixVerified):]
-			parts := splitN(rest, ":", 3)
-			if len(parts) != 3 {
-				continue
-			}
-			// parts[0]=level, parts[1]=metaTxID, parts[2]=step
-			if parts[1] == metaTxID {
-				if !seen[parts[2]] {
-					steps = append(steps, parts[2])
-					seen[parts[2]] = true
-				}
+			// 键格式: "v:metaTxID:step"
+			// step 是最后一个 ":" 之后的部分
+			stepStart := len(prefixVerified) + len(metaTxID) + 1
+			if stepStart < len(key) {
+				steps = append(steps, key[stepStart:])
 			}
 		}
 		return nil
@@ -371,42 +341,25 @@ func (s *Store) GetVerifiedSteps(metaTxID string) ([]string, error) {
 	return steps, err
 }
 
-// splitN 分割字符串为最多 n 部分
-func splitN(s, sep string, n int) []string {
-	result := make([]string, 0, n)
-	for i := 0; i < n-1; i++ {
-		idx := indexOf(s, sep)
-		if idx < 0 {
-			result = append(result, s)
-			return result
+// AllStepsVerified 检查指定步骤列表是否全部已验证
+func (s *Store) AllStepsVerified(metaTxID string, steps []string) (bool, error) {
+	for _, step := range steps {
+		ok, err := s.IsStepVerified(metaTxID, step)
+		if err != nil {
+			return false, err
 		}
-		result = append(result, s[:idx])
-		s = s[idx+len(sep):]
-	}
-	if s != "" || len(result) > 0 {
-		result = append(result, s)
-	}
-	return result
-}
-
-// indexOf 返回 sep 在 s 中第一次出现的位置，-1 表示未找到
-func indexOf(s, sep string) int {
-	for i := 0; i <= len(s)-len(sep); i++ {
-		if s[i:i+len(sep)] == sep {
-			return i
+		if !ok {
+			return false, nil
 		}
 	}
-	return -1
+	return true, nil
 }
 
-// MarkVerified 标记某个 metaTxID 已通过某级别验证（便捷方法）
+// MarkVerified 标记某个 metaTxID 已通过验证（便捷方法）
 // 内部将标记所有主要步骤（pow, index, ref_chain, integrity）为已验证
-func (s *Store) MarkVerified(metaTxID, level string) error {
+func (s *Store) MarkVerified(metaTxID string) error {
 	if metaTxID == "" {
 		return fmt.Errorf("index: metaTxID must not be empty")
-	}
-	if level == "" {
-		level = LevelLight
 	}
 
 	// 同时更新元数据索引中的 verified 字段（保持向后兼容）
@@ -417,7 +370,7 @@ func (s *Store) MarkVerified(metaTxID, level string) error {
 	if existing == nil {
 		existing = make(map[string]string)
 	}
-	existing["verified"] = level
+	existing["verified"] = "true"
 	existing["verifiedAt"] = strconv.FormatInt(time.Now().Unix(), 10)
 	if err := s.IndexMeta(metaTxID, existing); err != nil {
 		return fmt.Errorf("index: update meta verified: %w", err)
@@ -425,7 +378,7 @@ func (s *Store) MarkVerified(metaTxID, level string) error {
 
 	// 标记所有主要步骤
 	for _, step := range []string{StepPoW, StepIndex, StepRefChain, StepIntegrity} {
-		if err := s.MarkStepVerifiedAtLevel(metaTxID, step, level); err != nil {
+		if err := s.MarkStepVerified(metaTxID, step); err != nil {
 			return fmt.Errorf("index: mark step %s verified: %w", step, err)
 		}
 	}
@@ -433,9 +386,8 @@ func (s *Store) MarkVerified(metaTxID, level string) error {
 }
 
 // IsVerified 检查某个 metaTxID 是否已验证过（便捷方法）
-// level 为空时，检查是否通过任意级别验证
-// 新实现：同时检查旧的 meta 字段和新的按步骤缓存
-func (s *Store) IsVerified(metaTxID, level string) (bool, error) {
+// 同时检查旧的 meta 字段和新的按步骤缓存
+func (s *Store) IsVerified(metaTxID string) (bool, error) {
 	if metaTxID == "" {
 		return false, nil
 	}
@@ -448,36 +400,16 @@ func (s *Store) IsVerified(metaTxID, level string) (bool, error) {
 	if params != nil {
 		verifiedLevel, ok := params["verified"]
 		if ok && verifiedLevel != "none" && verifiedLevel != "" {
-			if level == "" {
-				return true, nil
-			}
-			if verifiedLevel == level {
-				return true, nil
-			}
+			return true, nil
 		}
 	}
 
-	// 再检查按步骤缓存
-	if level == "" {
-		// 检查任意级别的任意步骤
-		steps, err := s.GetVerifiedSteps(metaTxID)
-		if err != nil {
-			return false, err
-		}
-		return len(steps) > 0, nil
+	// 再检查按步骤缓存：至少有一个步骤通过即可
+	steps, err := s.GetVerifiedSteps(metaTxID)
+	if err != nil {
+		return false, err
 	}
-
-	// 检查指定级别的所有主要步骤是否都已通过
-	for _, step := range []string{StepPoW, StepIndex, StepRefChain, StepIntegrity} {
-		ok, err := s.IsStepVerifiedAtLevel(metaTxID, step, level)
-		if err != nil {
-			return false, err
-		}
-		if !ok {
-			return false, nil
-		}
-	}
-	return true, nil
+	return len(steps) > 0, nil
 }
 
 // GetAllMetaIDs 获取所有元数据 ID（用于启动时恢复）
