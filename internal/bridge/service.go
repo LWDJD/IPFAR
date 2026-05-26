@@ -1050,21 +1050,30 @@ func (s *Service) verifyReferenceChainOnline(meta *sdkmeta.Metadata) pipeline.Ve
 
 	// 使用 executeStepWithIncomplete 模式执行引用链验证
 	// 直接调用 pipeline 的引用验证器
-	err := refPipeline.VerifyReferenceChain(meta)
+	refVR, err := refPipeline.VerifyReferenceChain(meta)
 	if err != nil {
-		// 检查是否为不完整错误
-		if refErr, ok := err.(*pipeline.ReferenceIncompleteError); ok {
-			return pipeline.VerifyResult{
-				Step:       pipeline.StepReferenceChain,
-				Passed:     true,
-				Incomplete: true,
-				Message:    fmt.Sprintf("引用链不完整: %v", refErr),
-			}
-		}
 		return pipeline.VerifyResult{
 			Step:   pipeline.StepReferenceChain,
 			Passed: false,
 			Error:  fmt.Sprintf("引用链验证失败: %v", err),
+		}
+	}
+
+	// 检查是否不完整
+	if refVR.Incomplete {
+		return pipeline.VerifyResult{
+			Step:       pipeline.StepReferenceChain,
+			Passed:     true,
+			Incomplete: true,
+			Message:    fmt.Sprintf("引用链不完整: %s", refVR.Message),
+		}
+	}
+
+	if !refVR.Passed {
+		return pipeline.VerifyResult{
+			Step:   pipeline.StepReferenceChain,
+			Passed: false,
+			Error:  refVR.Error,
 		}
 	}
 

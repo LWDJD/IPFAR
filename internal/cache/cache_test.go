@@ -152,8 +152,9 @@ func TestLRUEviction(t *testing.T) {
 	maxSize := int64(1024) // 1 KB
 
 	c, err := New(CacheConfig{
-		Dir:     filepath.Join(tmpDir, "cache"),
-		MaxSize: maxSize,
+		Dir:                filepath.Join(tmpDir, "cache"),
+		MaxSize:            maxSize,
+		ProtectionDuration: 0, // 无保护期以测试驱逐
 	})
 	if err != nil {
 		t.Fatalf("New() 不应返回错误: %v", err)
