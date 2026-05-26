@@ -1,4 +1,4 @@
-// Package cache 提供本地文件缓存功能，支持 LRU 驱逐策略。
+// Package cache 提供本地文件缓存功能，支持 LRU 驱逐策略（带 min-age 保护）。
 //
 // 该模块为 IPFAR 桥节点提供以下能力：
 //   - CAR 文件缓存（避免重复从 Arweave 网关下载）
@@ -7,12 +7,15 @@
 //   - 文件系统 + LRU 驱逐策略
 //   - 可配置大小上限
 //   - 线程安全
+//   - min-age 保护：最近 10 分钟内访问过的条目不可驱逐
+//   - ErrCacheFull：缓存满且无可驱逐条目时拒绝写入
 //
 // 规范参考: ipfar-specs/V1/项目规划.md §四.6
 package cache
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +29,12 @@ import (
 
 // indexFileName 持久化索引文件名
 const indexFileName = "cache_index.json"
+
+// minAge 条目最小存活时间：最近 10 分钟内访问过的条目不可驱逐
+const minAge = 10 * time.Minute
+
+// ErrCacheFull 缓存满且无可驱逐条目（所有条目都在 min-age 保护期内）
+var ErrCacheFull = errors.New("cache is full and no entries are eligible for eviction")
 
 // CacheConfig 缓存配置
 type CacheConfig struct {
@@ -46,9 +55,10 @@ func DefaultCacheConfig() CacheConfig {
 // entryMeta 缓存条目元数据（写入索引文件）
 type entryMeta struct {
 	Key        string    `json:"key"`
-	FilePath    string    `json:"file_path"`
+	FilePath   string    `json:"file_path"`
 	Size       int64     `json:"size"`
 	LastAccess time.Time `json:"last_access"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // lruNode LRU 双向链表节点
@@ -82,7 +92,6 @@ type Cache struct {
 }
 
 // New 创建新的缓存实例
-// 如果配置的目录已存在旧索引，会自动加载。
 func New(config CacheConfig) (*Cache, error) {
 	dir := config.Dir
 	if dir == "" {
@@ -111,8 +120,9 @@ func New(config CacheConfig) (*Cache, error) {
 }
 
 // Put 写入缓存条目
-// key: 缓存键（通常是 txID 或 CID）
-// data: 要缓存的数据
+//
+// 如果缓存已满且所有条目都在 min-age 保护期内（10 分钟内被访问过），
+// 返回 ErrCacheFull。调用方应跳过缓存并记录警告。
 func (c *Cache) Put(key string, data []byte) error {
 	if key == "" {
 		return fmt.Errorf("缓存键不能为空")
@@ -142,14 +152,20 @@ func (c *Cache) Put(key string, data []byte) error {
 
 	// 如果设置了大小限制，淘汰直到有足够空间
 	if c.maxSize > 0 && c.currentSize+dataSize > c.maxSize {
-		c.evictLocked(c.currentSize + dataSize - c.maxSize)
+		if err := c.evictLocked(c.currentSize + dataSize - c.maxSize); err != nil {
+			// 驱逐失败，清理刚写入的文件并返回错误
+			os.Remove(filePath)
+			return err
+		}
 	}
 
+	now := time.Now()
 	entry := &entryMeta{
 		Key:        key,
-		FilePath:    filePath,
+		FilePath:   filePath,
 		Size:       dataSize,
-		LastAccess: time.Now(),
+		LastAccess: now,
+		CreatedAt:  now,
 	}
 
 	c.entries[key] = entry
@@ -169,7 +185,6 @@ func (c *Cache) Put(key string, data []byte) error {
 }
 
 // Get 从缓存读取数据
-// 返回 (data, found, error)
 func (c *Cache) Get(key string) ([]byte, bool, error) {
 	entry, ok := c.getEntry(key)
 	if !ok {
@@ -191,8 +206,7 @@ func (c *Cache) Get(key string) ([]byte, bool, error) {
 	return data, true, nil
 }
 
-// GetPath 获取缓存文件路径（不读取内容）
-// 返回 (filePath, found, error)
+// GetPath 获取缓存文件路径
 func (c *Cache) GetPath(key string) (string, bool, error) {
 	entry, ok := c.getEntry(key)
 	if !ok {
@@ -262,7 +276,7 @@ func (c *Cache) Stats() CacheStats {
 	}
 }
 
-// Close 关闭缓存（刷新索引到磁盘）
+// Close 关闭缓存
 func (c *Cache) Close() error {
 	c.saveIndex()
 	return nil
@@ -288,7 +302,7 @@ func (c *Cache) getEntry(key string) (*entryMeta, bool) {
 	return entry, true
 }
 
-// removeEntryLocked 删除条目（调用者必须持有 mu 写锁）
+// removeEntryLocked 删除条目
 func (c *Cache) removeEntryLocked(key string, entry *entryMeta) error {
 	if err := os.Remove(entry.FilePath); err != nil && !os.IsNotExist(err) {
 		return err
@@ -303,14 +317,29 @@ func (c *Cache) removeEntryLocked(key string, entry *entryMeta) error {
 }
 
 // evictLocked 驱逐条目直到释放至少 targetBytes 空间
-func (c *Cache) evictLocked(targetBytes int64) {
+//
+// 驱逐规则：
+//  1. 按 LastAccess 从旧到新遍历 LRU 链表
+//  2. 跳过最近 10 分钟内访问过的条目（min-age 保护）
+//  3. 如果所有条目都受保护，返回 ErrCacheFull
+func (c *Cache) evictLocked(targetBytes int64) error {
 	var evictedSize int64
+
 	for c.lruHead != nil && evictedSize < targetBytes {
 		oldestKey := c.lruHead.key
 		entry, ok := c.entries[oldestKey]
 		if !ok {
 			c.lruRemoveLocked(oldestKey)
 			continue
+		}
+
+		// min-age 保护：跳过最近 10 分钟内访问过的条目
+		if time.Since(entry.LastAccess) < minAge {
+			// head 受保护，则所有条目都受保护（链表按访问时间排序）
+			if evictedSize == 0 {
+				return ErrCacheFull
+			}
+			return fmt.Errorf("cache: insufficient evictable space after freeing %d bytes", evictedSize)
 		}
 
 		if err := os.Remove(entry.FilePath); err != nil && !os.IsNotExist(err) {
@@ -323,13 +352,19 @@ func (c *Cache) evictLocked(targetBytes int64) {
 		c.evictions++
 		c.lruRemoveLocked(oldestKey)
 
-		log.Debug("缓存：驱逐 key=%s size=%d evicted_total=%d", oldestKey, entry.Size, evictedSize)
+		log.Debug("缓存：驱逐 key=%s size=%d evicted_total=%d last_access=%v",
+			oldestKey, entry.Size, evictedSize, entry.LastAccess)
 	}
+
+	if evictedSize < targetBytes && c.lruHead == nil {
+		return ErrCacheFull
+	}
+
+	return nil
 }
 
 // filePath 生成缓存文件路径
 func (c *Cache) filePath(key string) string {
-	// 对 key 进行 sanitize，使用 key 的前缀分目录避免单目录文件过多
 	safeKey := sanitizeKey(key)
 	prefix := ""
 	if len(safeKey) >= 4 {
@@ -385,8 +420,8 @@ func (c *Cache) lruRemoveLocked(key string) {
 
 // saveIndex 保存索引到磁盘
 func (c *Cache) saveIndex() {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if !c.dirty {
 		return
@@ -397,7 +432,7 @@ func (c *Cache) saveIndex() {
 		entries = append(entries, e)
 	}
 
-	// 按 LastAccess 排序，方便加载时恢复 LRU 顺序
+	// 按 LastAccess 排序
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].LastAccess.Before(entries[j].LastAccess)
 	})
@@ -420,6 +455,8 @@ func (c *Cache) saveIndex() {
 		log.Warn("缓存：重命名索引文件失败: %v", err)
 		return
 	}
+
+	c.dirty = false
 }
 
 // loadIndex 从磁盘加载索引
@@ -432,7 +469,6 @@ func (c *Cache) loadIndex() error {
 
 	var entries []*entryMeta
 	if err := json.Unmarshal(data, &entries); err != nil {
-		// 索引文件损坏，删除并重新开始
 		os.Remove(indexPath)
 		return fmt.Errorf("索引文件损坏: %w", err)
 	}
@@ -441,17 +477,20 @@ func (c *Cache) loadIndex() error {
 	defer c.mu.Unlock()
 
 	for _, entry := range entries {
-		// 验证文件是否存在
 		if _, err := os.Stat(entry.FilePath); os.IsNotExist(err) {
 			log.Debug("缓存：索引条目文件丢失，跳过 key=%s", entry.Key)
 			continue
+		}
+
+		// 向后兼容：如果 CreatedAt 为零值，设置为 LastAccess
+		if entry.CreatedAt.IsZero() {
+			entry.CreatedAt = entry.LastAccess
 		}
 
 		c.entries[entry.Key] = entry
 		c.currentSize += entry.Size
 		c.totalEntries++
 
-		// 按 LastAccess 顺序重建 LRU 链表
 		c.lruPushBackLocked(entry.Key)
 	}
 
