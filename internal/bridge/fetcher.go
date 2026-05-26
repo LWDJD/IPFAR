@@ -348,56 +348,40 @@ func (bf *BlockFetcher) SetStrictVerifier(v StrictVerifier) {
 	bf.strictVerifier = v
 }
 
-// ensureStrictVerified 确保指定 metaTxID 已通过 strict 级别全步骤验证
+// ensureStrictVerified 确保指定 metaTxID 已通过全部 4 个步骤验证
 //
 // 在从 Arweave 下载块数据之前调用，确保数据源可信。
 // 检查顺序：pow → index → ref_chain → integrity
-// 如果 strict 级别已全部缓存，直接返回 nil（跳过验证）。
+// 如果全部步骤已缓存，直接返回 nil（跳过验证）。
 // 验证失败则返回错误（调用方应跳过该 metaTxID，尝试下一个来源）。
 func (bf *BlockFetcher) ensureStrictVerified(ctx context.Context, metaTxID string) error {
 	steps := []string{index.StepPoW, index.StepIndex, index.StepRefChain, index.StepIntegrity}
 
-	// 检查 strict 级别所有步骤是否已验证
-	allCached := true
-	for _, step := range steps {
-		ok, err := bf.index.IsStepVerifiedAtLevel(metaTxID, step, index.LevelStrict)
-		if err != nil {
-			log.Warn("BlockFetcher：检查 strict 验证缓存失败 step=%s metaTxID=%s: %v", step, metaTxID, err)
-			allCached = false
-			break
-		}
-		if !ok {
-			allCached = false
-			break
-		}
-	}
-
-	if allCached {
-		log.Debug("BlockFetcher：strict 级别全部步骤已缓存 metaTxID=%s", metaTxID)
+	// 检查所有步骤是否已验证
+	if allCached, err := bf.index.AllStepsVerified(metaTxID, steps); err != nil {
+		log.Warn("BlockFetcher：检查验证缓存失败 metaTxID=%s: %v", metaTxID, err)
+	} else if allCached {
+		log.Debug("BlockFetcher：全部步骤已缓存 metaTxID=%s", metaTxID)
 		return nil
 	}
 
-	// 需要执行 strict 验证
+	// 需要执行验证
 	if bf.strictVerifier == nil {
 		return fmt.Errorf("BlockFetcher: strict verification required for %s but no verifier configured", metaTxID)
 	}
 
-	log.Info("BlockFetcher：开始 strict 级别验证 metaTxID=%s", metaTxID)
+	log.Info("BlockFetcher：开始验证 metaTxID=%s", metaTxID)
 	if err := bf.strictVerifier(ctx, metaTxID); err != nil {
-		return fmt.Errorf("BlockFetcher: strict verification failed for %s: %w", metaTxID, err)
+		return fmt.Errorf("BlockFetcher: verification failed for %s: %w", metaTxID, err)
 	}
 
 	// 验证后再次检查所有步骤是否已标记
-	for _, step := range steps {
-		ok, err := bf.index.IsStepVerifiedAtLevel(metaTxID, step, index.LevelStrict)
-		if err != nil {
-			return fmt.Errorf("BlockFetcher: post-verification cache check failed step=%s: %w", step, err)
-		}
-		if !ok {
-			return fmt.Errorf("BlockFetcher: strict verification incomplete: step %s not marked for %s", step, metaTxID)
-		}
+	if allCached, err := bf.index.AllStepsVerified(metaTxID, steps); err != nil {
+		return fmt.Errorf("BlockFetcher: post-verification cache check failed: %w", err)
+	} else if !allCached {
+		return fmt.Errorf("BlockFetcher: verification incomplete for %s", metaTxID)
 	}
 
-	log.Info("BlockFetcher：strict 级别验证通过 metaTxID=%s", metaTxID)
+	log.Info("BlockFetcher：验证通过 metaTxID=%s", metaTxID)
 	return nil
 }

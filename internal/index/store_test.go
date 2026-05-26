@@ -173,26 +173,37 @@ func TestStore_MarkVerified(t *testing.T) {
 	}
 
 	// 标记为已验证
-	if err := s.MarkVerified(metaTxID, "light"); err != nil {
+	if err := s.MarkVerified(metaTxID); err != nil {
 		t.Fatalf("MarkVerified 失败: %v", err)
 	}
 
 	// 检查验证状态
-	verified, err := s.IsVerified(metaTxID, "light")
+	verified, err := s.IsVerified(metaTxID)
 	if err != nil {
 		t.Fatalf("IsVerified 失败: %v", err)
 	}
 	if !verified {
-		t.Fatal("应该被标记为 light 验证通过")
+		t.Fatal("应该被标记为验证通过")
 	}
 
-	// 检查不同级别
-	verifiedFull, err := s.IsVerified(metaTxID, "full")
-	if err != nil {
-		t.Fatalf("IsVerified(full) 失败: %v", err)
+	// 同时检查按步骤缓存
+	for _, step := range []string{StepPoW, StepIndex, StepRefChain, StepIntegrity} {
+		ok, err := s.IsStepVerified(metaTxID, step)
+		if err != nil {
+			t.Fatalf("IsStepVerified(%s) 失败: %v", step, err)
+		}
+		if !ok {
+			t.Fatalf("步骤 %s 应该被标记为已验证", step)
+		}
 	}
-	if verifiedFull {
-		t.Fatal("不应该被标记为 full 验证通过")
+
+	// 检查 AllStepsVerified
+	allVerified, err := s.AllStepsVerified(metaTxID, []string{StepPoW, StepIndex, StepRefChain, StepIntegrity})
+	if err != nil {
+		t.Fatalf("AllStepsVerified 失败: %v", err)
+	}
+	if !allVerified {
+		t.Fatal("AllStepsVerified 应该返回 true")
 	}
 }
 

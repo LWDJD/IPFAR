@@ -818,19 +818,13 @@ func (s *Service) ProcessMetadataTX(txID string) (*PipelineResult, error) {
 func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 	log.Info("桥接服务：处理元数据交易 %s", txID)
 
-	// 确定当前安全级别
-	level := s.config.Preset
-	if level == "" {
-		level = index.LevelLight
-	}
-
 	// 获取验证配置
 	vcfg := s.config.getVerifyConfig()
 
 	// Step 0: 按步骤验证缓存检查
 	if s.indexStore != nil {
-		if s.allStepsCachedAtLevel(txID, vcfg, level) {
-			log.Info("桥接服务：元数据已通过 %s 级别所有步骤验证，跳过 pipeline txID=%s", level, txID)
+		if s.allStepsCached(txID, vcfg) {
+			log.Info("桥接服务：元数据所有步骤已验证通过，跳过 pipeline txID=%s", txID)
 			return &PipelineResult{
 				Meta:       nil,
 				Passed:     true,
@@ -863,7 +857,7 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 	}
 
 	// Step 2: 运行快速验证（使用去除了已缓存步骤的配置）
-	quickResult := s.runPipelineWithCacheSkip(meta, false, txID, level)
+	quickResult := s.runPipelineWithCacheSkip(meta, false, txID)
 
 	if !quickResult.Passed {
 		log.Warn("桥接服务：快速验证失败 root_cid=%s", meta.RootCID)
@@ -916,9 +910,9 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 
 	// M2: 验证通过后按步骤标记已验证
 	if result != nil && result.Passed && s.indexStore != nil {
-		s.cacheStepResults(txID, result.Steps, level)
+		s.cacheStepResults(txID, result.Steps)
 		// 同时保持向后兼容的 MarkVerified
-		if err := s.indexStore.MarkVerified(txID, level); err != nil {
+		if err := s.indexStore.MarkVerified(txID); err != nil {
 			log.Warn("桥接服务：标记已验证失败 txID=%s: %v", txID, err)
 		}
 	}
@@ -1280,35 +1274,35 @@ func (s *Service) cacheSameBundleData(metadataTxID string, meta *sdkmeta.Metadat
 // 按步骤验证缓存辅助方法
 // ============================================================
 
-// allStepsCachedAtLevel 检查指定安全级别下所有启用的步骤是否均已缓存
-func (s *Service) allStepsCachedAtLevel(txID string, vcfg pipeline.VerifyConfig, level string) bool {
+// allStepsCached 检查配置中所有启用的步骤是否均已缓存
+func (s *Service) allStepsCached(txID string, vcfg pipeline.VerifyConfig) bool {
 	if s.indexStore == nil {
 		return false
 	}
 
 	// meta_validate 始终强制执行，检查其缓存状态
-	if metaCached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepMetaValidate, level); !metaCached {
+	if metaCached, _ := s.indexStore.IsStepVerified(txID, index.StepMetaValidate); !metaCached {
 		return false
 	}
 
 	// 检查各主要步骤
 	if vcfg.VerifyPoW {
-		if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepPoW, level); !cached {
+		if cached, _ := s.indexStore.IsStepVerified(txID, index.StepPoW); !cached {
 			return false
 		}
 	}
 	if vcfg.VerifyIndex {
-		if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepIndex, level); !cached {
+		if cached, _ := s.indexStore.IsStepVerified(txID, index.StepIndex); !cached {
 			return false
 		}
 	}
 	if vcfg.VerifyReferenceChain {
-		if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepRefChain, level); !cached {
+		if cached, _ := s.indexStore.IsStepVerified(txID, index.StepRefChain); !cached {
 			return false
 		}
 	}
 	if vcfg.VerifyIntegrity {
-		if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepIntegrity, level); !cached {
+		if cached, _ := s.indexStore.IsStepVerified(txID, index.StepIntegrity); !cached {
 			return false
 		}
 	}
@@ -1318,7 +1312,7 @@ func (s *Service) allStepsCachedAtLevel(txID string, vcfg pipeline.VerifyConfig,
 
 // runPipelineWithCacheSkip 运行验证管道，跳过已缓存的步骤
 // 通过构建临时 pipeline 配置，将已缓存的步骤标记为 disabled
-func (s *Service) runPipelineWithCacheSkip(meta *sdkmeta.Metadata, carAvailable bool, txID, level string) *pipeline.PipelineResult {
+func (s *Service) runPipelineWithCacheSkip(meta *sdkmeta.Metadata, carAvailable bool, txID string) *pipeline.PipelineResult {
 	vcfg := s.config.getVerifyConfig()
 
 	// 如果有索引存储，检查并跳过已缓存的步骤
@@ -1327,27 +1321,27 @@ func (s *Service) runPipelineWithCacheSkip(meta *sdkmeta.Metadata, carAvailable 
 		runCfg := vcfg // 复制
 
 		if vcfg.VerifyPoW {
-			if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepPoW, level); cached {
+			if cached, _ := s.indexStore.IsStepVerified(txID, index.StepPoW); cached {
 				runCfg.VerifyPoW = false
-				log.Debug("桥接服务：跳过已缓存的 PoW 验证 txID=%s level=%s", txID, level)
+				log.Debug("桥接服务：跳过已缓存的 PoW 验证 txID=%s", txID)
 			}
 		}
 		if vcfg.VerifyIndex {
-			if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepIndex, level); cached {
+			if cached, _ := s.indexStore.IsStepVerified(txID, index.StepIndex); cached {
 				runCfg.VerifyIndex = false
-				log.Debug("桥接服务：跳过已缓存的 Index 验证 txID=%s level=%s", txID, level)
+				log.Debug("桥接服务：跳过已缓存的 Index 验证 txID=%s", txID)
 			}
 		}
 		if vcfg.VerifyReferenceChain {
-			if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepRefChain, level); cached {
+			if cached, _ := s.indexStore.IsStepVerified(txID, index.StepRefChain); cached {
 				runCfg.VerifyReferenceChain = false
-				log.Debug("桥接服务：跳过已缓存的引用链验证 txID=%s level=%s", txID, level)
+				log.Debug("桥接服务：跳过已缓存的引用链验证 txID=%s", txID)
 			}
 		}
 		if vcfg.VerifyIntegrity {
-			if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepIntegrity, level); cached {
+			if cached, _ := s.indexStore.IsStepVerified(txID, index.StepIntegrity); cached {
 				runCfg.VerifyIntegrity = false
-				log.Debug("桥接服务：跳过已缓存的完整性验证 txID=%s level=%s", txID, level)
+				log.Debug("桥接服务：跳过已缓存的完整性验证 txID=%s", txID)
 			}
 		}
 
@@ -1399,7 +1393,7 @@ func (s *Service) runPipelineWithCacheSkip(meta *sdkmeta.Metadata, carAvailable 
 }
 
 // cacheStepResults 将管道步骤结果缓存到索引存储
-func (s *Service) cacheStepResults(txID string, steps []pipeline.VerifyResult, level string) {
+func (s *Service) cacheStepResults(txID string, steps []pipeline.VerifyResult) {
 	if s.indexStore == nil {
 		return
 	}
@@ -1407,10 +1401,10 @@ func (s *Service) cacheStepResults(txID string, steps []pipeline.VerifyResult, l
 	for _, r := range steps {
 		// 只缓存实际通过（非跳过）的步骤
 		if r.Passed && !r.Skipped {
-			if err := s.indexStore.MarkStepVerifiedAtLevel(txID, r.Step, level); err != nil {
+			if err := s.indexStore.MarkStepVerified(txID, r.Step); err != nil {
 				log.Warn("桥接服务：缓存步骤验证失败 txID=%s step=%s: %v", txID, r.Step, err)
 			} else {
-				log.Debug("桥接服务：已缓存步骤验证 txID=%s step=%s level=%s", txID, r.Step, level)
+				log.Debug("桥接服务：已缓存步骤验证 txID=%s step=%s", txID, r.Step)
 			}
 		}
 	}
@@ -1422,7 +1416,7 @@ func (s *Service) cacheStepResults(txID string, steps []pipeline.VerifyResult, l
 // 执行流程：
 //  1. 获取元数据
 //  2. 运行全开 pipeline（PoW + Index + RefChain + Integrity）
-//  3. 将每个通过的步骤标记为 strict 级别已验证
+//  3. 将每个通过的步骤标记为已验证
 //  4. 失败则返回错误
 func (s *Service) strictVerifyMetadata(ctx context.Context, metaTxID string) error {
 	log.Info("桥接服务：执行 strict 级别验证 metaTxID=%s", metaTxID)
@@ -1433,7 +1427,7 @@ func (s *Service) strictVerifyMetadata(ctx context.Context, metaTxID string) err
 		return fmt.Errorf("strict verify: fetch metadata %s: %w", metaTxID, err)
 	}
 
-	// 2. 运行 strict 级别 pipeline（全开：PoW + Index + RefChain + Integrity）
+	// 2. 运行全开 pipeline（PoW + Index + RefChain + Integrity）
 	strictBridge := NewBridge(true, true, true, true)
 	if s.bridge.GetGatewayClient() != nil {
 		strictBridge.SetGatewayClient(s.bridge.GetGatewayClient())
@@ -1453,18 +1447,18 @@ func (s *Service) strictVerifyMetadata(ctx context.Context, metaTxID string) err
 	// 3. 缓存每个通过的步骤
 	for _, r := range quickResult.Results {
 		if r.Passed && !r.Skipped {
-			if err := s.indexStore.MarkStepVerifiedAtLevel(metaTxID, r.Step, index.LevelStrict); err != nil {
-				log.Warn("桥接服务：缓存 strict 步骤失败 step=%s: %v", r.Step, err)
+			if err := s.indexStore.MarkStepVerified(metaTxID, r.Step); err != nil {
+				log.Warn("桥接服务：缓存步骤验证失败 step=%s: %v", r.Step, err)
 			}
 		}
 	}
 
 	// 同时标记向后兼容的 verified 字段
-	if err := s.indexStore.MarkVerified(metaTxID, index.LevelStrict); err != nil {
-		log.Warn("桥接服务：标记 strict verified 失败: %v", err)
+	if err := s.indexStore.MarkVerified(metaTxID); err != nil {
+		log.Warn("桥接服务：标记 verified 失败: %v", err)
 	}
 
-	log.Info("桥接服务：strict 级别验证通过 metaTxID=%s", metaTxID)
+	log.Info("桥接服务：验证通过 metaTxID=%s", metaTxID)
 	return nil
 }
 
