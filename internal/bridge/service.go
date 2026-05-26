@@ -11,6 +11,7 @@ import (
 	sdkArweave "github.com/LWDJD/ipfar-sdk/arweave"
 	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
 	"github.com/LWDJD/ipfar-sdk/verify/pipeline"
+	"github.com/LWDJD/ipfar-sdk/verify/pow"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/ipfs/go-cid"
 
@@ -403,6 +404,16 @@ func (s *Service) initGraphQLScan(cfg ServiceConfig) error {
 	}
 	s.blockWatcher = discovery.NewBlockWatcher(watcherCfg)
 
+	// 3. 注册回调：扫描器 / 监听器发现元数据后 → 触发 Service 完整 pipeline
+	s.graphQLScanner.SetOnMetaFound(func(txID string, metaJSON []byte, height uint64) {
+		s.processMetadataTX(txID)
+	})
+	s.blockWatcher.SetOnBlockFound(func(height uint64, metadataTXIDs []string) {
+		for _, txID := range metadataTXIDs {
+			s.processMetadataTX(txID)
+		}
+	})
+
 	log.Info("桥接服务：GraphQL 顺序扫描 + 区块监听已初始化 minHeight=%d batchSize=%d",
 		cfg.MinBlockHeight, scannerCfg.BatchSize)
 	return nil
@@ -506,6 +517,7 @@ func (s *Service) initBitswap(cfg ServiceConfig) error {
 		Cache:                  blockCache,
 		Gateway:                s.fetcher.GetGateway(),
 		MaxConcurrentDownloads: cfg.DownloadMaxConcurrency,
+		StrictVerifier:         s.strictVerifyMetadata, // Bitswap 请求时升到 strict 级别验证
 	}
 	if bfCfg.MaxConcurrentDownloads <= 0 {
 		bfCfg.MaxConcurrentDownloads = 4
@@ -806,11 +818,19 @@ func (s *Service) ProcessMetadataTX(txID string) (*PipelineResult, error) {
 func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 	log.Info("桥接服务：处理元数据交易 %s", txID)
 
-	// Step 0: 验证缓存检查（M2）
+	// 确定当前安全级别
+	level := s.config.Preset
+	if level == "" {
+		level = index.LevelLight
+	}
+
+	// 获取验证配置
+	vcfg := s.config.getVerifyConfig()
+
+	// Step 0: 按步骤验证缓存检查
 	if s.indexStore != nil {
-		// 检查是否已验证过（light 级别）
-		if verified, _ := s.indexStore.IsVerified(txID, "light"); verified {
-			log.Info("桥接服务：元数据已通过 light 验证，跳过 pipeline 验证 txID=%s", txID)
+		if s.allStepsCachedAtLevel(txID, vcfg, level) {
+			log.Info("桥接服务：元数据已通过 %s 级别所有步骤验证，跳过 pipeline txID=%s", level, txID)
 			return &PipelineResult{
 				Meta:       nil,
 				Passed:     true,
@@ -842,8 +862,8 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 		s.indexMetadataCIDs(txID, meta)
 	}
 
-	// Step 2: 运行快速验证
-	quickResult := s.bridge.RunPipeline(meta, false)
+	// Step 2: 运行快速验证（使用去除了已缓存步骤的配置）
+	quickResult := s.runPipelineWithCacheSkip(meta, false, txID, level)
 
 	if !quickResult.Passed {
 		log.Warn("桥接服务：快速验证失败 root_cid=%s", meta.RootCID)
@@ -894,9 +914,11 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 		}
 	}
 
-	// M2: 验证通过后标记已验证
+	// M2: 验证通过后按步骤标记已验证
 	if result != nil && result.Passed && s.indexStore != nil {
-		if err := s.indexStore.MarkVerified(txID, "light"); err != nil {
+		s.cacheStepResults(txID, result.Steps, level)
+		// 同时保持向后兼容的 MarkVerified
+		if err := s.indexStore.MarkVerified(txID, level); err != nil {
 			log.Warn("桥接服务：标记已验证失败 txID=%s: %v", txID, err)
 		}
 	}
@@ -1252,6 +1274,198 @@ func (s *Service) cacheSameBundleData(metadataTxID string, meta *sdkmeta.Metadat
 	}
 
 	log.Info("桥接服务：同 Bundle 数据已缓存 item=%s size=%d", meta.DataTXID, len(rawData))
+}
+
+// ============================================================
+// 按步骤验证缓存辅助方法
+// ============================================================
+
+// allStepsCachedAtLevel 检查指定安全级别下所有启用的步骤是否均已缓存
+func (s *Service) allStepsCachedAtLevel(txID string, vcfg pipeline.VerifyConfig, level string) bool {
+	if s.indexStore == nil {
+		return false
+	}
+
+	// meta_validate 始终强制执行，检查其缓存状态
+	if metaCached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepMetaValidate, level); !metaCached {
+		return false
+	}
+
+	// 检查各主要步骤
+	if vcfg.VerifyPoW {
+		if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepPoW, level); !cached {
+			return false
+		}
+	}
+	if vcfg.VerifyIndex {
+		if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepIndex, level); !cached {
+			return false
+		}
+	}
+	if vcfg.VerifyReferenceChain {
+		if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepRefChain, level); !cached {
+			return false
+		}
+	}
+	if vcfg.VerifyIntegrity {
+		if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepIntegrity, level); !cached {
+			return false
+		}
+	}
+
+	return true
+}
+
+// runPipelineWithCacheSkip 运行验证管道，跳过已缓存的步骤
+// 通过构建临时 pipeline 配置，将已缓存的步骤标记为 disabled
+func (s *Service) runPipelineWithCacheSkip(meta *sdkmeta.Metadata, carAvailable bool, txID, level string) *pipeline.PipelineResult {
+	vcfg := s.config.getVerifyConfig()
+
+	// 如果有索引存储，检查并跳过已缓存的步骤
+	if s.indexStore != nil {
+		// 构建去除已缓存步骤的配置
+		runCfg := vcfg // 复制
+
+		if vcfg.VerifyPoW {
+			if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepPoW, level); cached {
+				runCfg.VerifyPoW = false
+				log.Debug("桥接服务：跳过已缓存的 PoW 验证 txID=%s level=%s", txID, level)
+			}
+		}
+		if vcfg.VerifyIndex {
+			if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepIndex, level); cached {
+				runCfg.VerifyIndex = false
+				log.Debug("桥接服务：跳过已缓存的 Index 验证 txID=%s level=%s", txID, level)
+			}
+		}
+		if vcfg.VerifyReferenceChain {
+			if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepRefChain, level); cached {
+				runCfg.VerifyReferenceChain = false
+				log.Debug("桥接服务：跳过已缓存的引用链验证 txID=%s level=%s", txID, level)
+			}
+		}
+		if vcfg.VerifyIntegrity {
+			if cached, _ := s.indexStore.IsStepVerifiedAtLevel(txID, index.StepIntegrity, level); cached {
+				runCfg.VerifyIntegrity = false
+				log.Debug("桥接服务：跳过已缓存的完整性验证 txID=%s level=%s", txID, level)
+			}
+		}
+
+		// 如果所有步骤都被跳过，创建一个全 passed 的结果（但保留已缓存的步骤结果）
+		allSkipped := (!vcfg.VerifyPoW || runCfg.VerifyPoW == false) &&
+			(!vcfg.VerifyIndex || runCfg.VerifyIndex == false) &&
+			(!vcfg.VerifyReferenceChain || runCfg.VerifyReferenceChain == false) &&
+			(!vcfg.VerifyIntegrity || runCfg.VerifyIntegrity == false)
+
+		if allSkipped && (vcfg.VerifyPoW || vcfg.VerifyIndex || vcfg.VerifyReferenceChain || vcfg.VerifyIntegrity) {
+			// 所有启用的步骤都已缓存，返回通过结果
+			results := []pipeline.VerifyResult{
+				{Step: pipeline.StepMetaValidate, Passed: true, Message: "cached"},
+			}
+			if vcfg.VerifyPoW {
+				results = append(results, pipeline.VerifyResult{Step: pipeline.StepPoW, Passed: true, Message: "cached"})
+			}
+			if vcfg.VerifyIndex {
+				results = append(results, pipeline.VerifyResult{Step: pipeline.StepIndexExistence, Passed: true, Message: "cached"})
+				results = append(results, pipeline.VerifyResult{Step: pipeline.StepIndex, Passed: true, Message: "cached"})
+			}
+			if vcfg.VerifyReferenceChain {
+				results = append(results, pipeline.VerifyResult{Step: pipeline.StepReferenceChain, Passed: true, Message: "cached"})
+			}
+			if vcfg.VerifyIntegrity {
+				results = append(results, pipeline.VerifyResult{Step: pipeline.StepIntegrity, Passed: true, Message: "cached"})
+			}
+			return &pipeline.PipelineResult{Passed: true, Results: results}
+		}
+
+		// 创建临时 pipeline 使用修改后的配置
+		p := pipeline.NewPipeline(runCfg)
+		if s.bridge.GetGatewayClient() != nil {
+			p.SetGatewayClient(s.bridge.GetGatewayClient())
+		}
+		// 注入 PoW 验证器（带日志）
+		p.SetPoWVerifier(func(powStr, powAlg, rootCID, dataTXID string, dataSize int64) error {
+			err := pow.Verify(powStr, powAlg, rootCID, dataTXID, dataSize)
+			if err != nil {
+				log.Warn("管道 PoW 验证失败：root_cid=%s, error=%v", rootCID, err)
+			}
+			return err
+		})
+		return p.Verify(meta, carAvailable)
+	}
+
+	// 没有索引存储，使用默认 bridge 运行
+	return s.bridge.RunPipeline(meta, carAvailable)
+}
+
+// cacheStepResults 将管道步骤结果缓存到索引存储
+func (s *Service) cacheStepResults(txID string, steps []pipeline.VerifyResult, level string) {
+	if s.indexStore == nil {
+		return
+	}
+
+	for _, r := range steps {
+		// 只缓存实际通过（非跳过）的步骤
+		if r.Passed && !r.Skipped {
+			if err := s.indexStore.MarkStepVerifiedAtLevel(txID, r.Step, level); err != nil {
+				log.Warn("桥接服务：缓存步骤验证失败 txID=%s step=%s: %v", txID, r.Step, err)
+			} else {
+				log.Debug("桥接服务：已缓存步骤验证 txID=%s step=%s level=%s", txID, r.Step, level)
+			}
+		}
+	}
+}
+
+// strictVerifyMetadata 对指定 metaTxID 执行 strict 级别全步骤验证
+//
+// 实现 StrictVerifier 接口，供 BlockFetcher 在 Bitswap 请求时调用。
+// 执行流程：
+//  1. 获取元数据
+//  2. 运行全开 pipeline（PoW + Index + RefChain + Integrity）
+//  3. 将每个通过的步骤标记为 strict 级别已验证
+//  4. 失败则返回错误
+func (s *Service) strictVerifyMetadata(ctx context.Context, metaTxID string) error {
+	log.Info("桥接服务：执行 strict 级别验证 metaTxID=%s", metaTxID)
+
+	// 1. 获取元数据
+	meta, err := s.fetcher.FetchMetadataByTXID(metaTxID)
+	if err != nil {
+		return fmt.Errorf("strict verify: fetch metadata %s: %w", metaTxID, err)
+	}
+
+	// 2. 运行 strict 级别 pipeline（全开：PoW + Index + RefChain + Integrity）
+	strictBridge := NewBridge(true, true, true, true)
+	if s.bridge.GetGatewayClient() != nil {
+		strictBridge.SetGatewayClient(s.bridge.GetGatewayClient())
+	}
+	quickResult := strictBridge.RunPipeline(meta, false)
+
+	if !quickResult.Passed {
+		// 记录失败详情
+		for _, r := range quickResult.Results {
+			if !r.Passed && !r.Skipped {
+				log.Warn("桥接服务：strict 验证步骤 %s 失败: %s", r.Step, r.Error)
+			}
+		}
+		return fmt.Errorf("strict verify: pipeline failed for %s", metaTxID)
+	}
+
+	// 3. 缓存每个通过的步骤
+	for _, r := range quickResult.Results {
+		if r.Passed && !r.Skipped {
+			if err := s.indexStore.MarkStepVerifiedAtLevel(metaTxID, r.Step, index.LevelStrict); err != nil {
+				log.Warn("桥接服务：缓存 strict 步骤失败 step=%s: %v", r.Step, err)
+			}
+		}
+	}
+
+	// 同时标记向后兼容的 verified 字段
+	if err := s.indexStore.MarkVerified(metaTxID, index.LevelStrict); err != nil {
+		log.Warn("桥接服务：标记 strict verified 失败: %v", err)
+	}
+
+	log.Info("桥接服务：strict 级别验证通过 metaTxID=%s", metaTxID)
+	return nil
 }
 
 // GetOnlineVerifier 获取在线验证器
