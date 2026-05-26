@@ -23,6 +23,10 @@ import (
 	"github.com/lwdjd/IPFAR/internal/log"
 )
 
+// StrictVerifier 严格级别验证器函数类型
+// 对指定 metaTxID 执行 strict 级别全步骤验证并缓存结果
+type StrictVerifier func(ctx context.Context, metaTxID string) error
+
 // BlockFetcherConfig 按需拉取器配置
 type BlockFetcherConfig struct {
 	// IndexStore CID → Arweave 位置索引（两层索引）
@@ -42,6 +46,9 @@ type BlockFetcherConfig struct {
 
 	// Timeout 单次下载超时（0 使用默认值 30s）
 	Timeout time.Duration
+
+	// StrictVerifier 严格级别验证器（用于 Bitswap 请求时确保数据有效性）
+	StrictVerifier StrictVerifier
 }
 
 // DefaultBlockFetcherConfig 返回默认配置
@@ -63,6 +70,9 @@ type BlockFetcher struct {
 	index   *index.Store
 	cache   *cache.Cache
 	gateway *download.Gateway
+
+	// strictVerifier 严格级别验证器（nil 表示跳过 strict 验证）
+	strictVerifier StrictVerifier
 
 	// 并发控制：带缓冲 channel 作为信号量
 	downloadSem chan struct{}
@@ -125,12 +135,13 @@ func NewBlockFetcher(cfg BlockFetcherConfig) (*BlockFetcher, error) {
 	_ = timeout // used in context deadlines
 
 	bf := &BlockFetcher{
-		config:      cfg,
-		index:       cfg.IndexStore,
-		cache:       cacheInst,
-		gateway:     gateway,
-		downloadSem: make(chan struct{}, maxConcurrent),
-		inFlight:    make(map[string]*inFlightReq),
+		config:         cfg,
+		index:          cfg.IndexStore,
+		cache:          cacheInst,
+		gateway:        gateway,
+		strictVerifier: cfg.StrictVerifier,
+		downloadSem:    make(chan struct{}, maxConcurrent),
+		inFlight:       make(map[string]*inFlightReq),
 	}
 
 	log.Info("BlockFetcher：初始化完成 max_concurrent=%d", maxConcurrent)
@@ -217,6 +228,13 @@ func (bf *BlockFetcher) FetchBlock(ctx context.Context, cidStr string) ([]byte, 
 			continue
 		}
 		if params == nil {
+			continue
+		}
+
+		// Step 3.5: 严格级别验证（Bitswap 请求时升到最高级别）
+		if err := bf.ensureStrictVerified(ctx, metaTxID); err != nil {
+			lastErr = fmt.Errorf("BlockFetcher: strict verification failed for %s: %w", metaTxID, err)
+			log.Warn("BlockFetcher：strict 验证失败 metaTxID=%s: %v，尝试下一个来源", metaTxID, err)
 			continue
 		}
 
@@ -323,4 +341,63 @@ func (bf *BlockFetcher) Cache() *cache.Cache {
 // IndexStore 返回内部索引存储
 func (bf *BlockFetcher) IndexStore() *index.Store {
 	return bf.index
+}
+
+// SetStrictVerifier 设置严格级别验证器
+func (bf *BlockFetcher) SetStrictVerifier(v StrictVerifier) {
+	bf.strictVerifier = v
+}
+
+// ensureStrictVerified 确保指定 metaTxID 已通过 strict 级别全步骤验证
+//
+// 在从 Arweave 下载块数据之前调用，确保数据源可信。
+// 检查顺序：pow → index → ref_chain → integrity
+// 如果 strict 级别已全部缓存，直接返回 nil（跳过验证）。
+// 验证失败则返回错误（调用方应跳过该 metaTxID，尝试下一个来源）。
+func (bf *BlockFetcher) ensureStrictVerified(ctx context.Context, metaTxID string) error {
+	steps := []string{index.StepPoW, index.StepIndex, index.StepRefChain, index.StepIntegrity}
+
+	// 检查 strict 级别所有步骤是否已验证
+	allCached := true
+	for _, step := range steps {
+		ok, err := bf.index.IsStepVerifiedAtLevel(metaTxID, step, index.LevelStrict)
+		if err != nil {
+			log.Warn("BlockFetcher：检查 strict 验证缓存失败 step=%s metaTxID=%s: %v", step, metaTxID, err)
+			allCached = false
+			break
+		}
+		if !ok {
+			allCached = false
+			break
+		}
+	}
+
+	if allCached {
+		log.Debug("BlockFetcher：strict 级别全部步骤已缓存 metaTxID=%s", metaTxID)
+		return nil
+	}
+
+	// 需要执行 strict 验证
+	if bf.strictVerifier == nil {
+		return fmt.Errorf("BlockFetcher: strict verification required for %s but no verifier configured", metaTxID)
+	}
+
+	log.Info("BlockFetcher：开始 strict 级别验证 metaTxID=%s", metaTxID)
+	if err := bf.strictVerifier(ctx, metaTxID); err != nil {
+		return fmt.Errorf("BlockFetcher: strict verification failed for %s: %w", metaTxID, err)
+	}
+
+	// 验证后再次检查所有步骤是否已标记
+	for _, step := range steps {
+		ok, err := bf.index.IsStepVerifiedAtLevel(metaTxID, step, index.LevelStrict)
+		if err != nil {
+			return fmt.Errorf("BlockFetcher: post-verification cache check failed step=%s: %w", step, err)
+		}
+		if !ok {
+			return fmt.Errorf("BlockFetcher: strict verification incomplete: step %s not marked for %s", step, metaTxID)
+		}
+	}
+
+	log.Info("BlockFetcher：strict 级别验证通过 metaTxID=%s", metaTxID)
+	return nil
 }

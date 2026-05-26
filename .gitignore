@@ -2,3 +2,7 @@ language/
 config.json
 ipfar.exe
 logs/
+internal/bridge/cache/
+internal/dedup/
+download.test
+ipfar

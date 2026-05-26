@@ -24,6 +24,12 @@ import (
 	"github.com/lwdjd/IPFAR/internal/log"
 )
 
+// OnMetaFound 元数据发现回调
+// metaTXID: 元数据交易 ID
+// metaJSON: 元数据 JSON 原始字节
+// blockHeight: 元数据所在区块高度
+type OnMetaFound func(metaTXID string, metaJSON []byte, blockHeight uint64)
+
 // GraphQLScanner 从旧到新顺序扫描 Arweave 区块，查找 IPFAR 元数据交易
 type GraphQLScanner struct {
 	client   *sdkArweave.GatewayClient
@@ -49,6 +55,9 @@ type GraphQLScanner struct {
 	// 统计
 	stats      ScannerStats
 	statsMu    sync.RWMutex
+
+	// 回调
+	onMetaFound OnMetaFound
 }
 
 // ScannerStats 扫描器统计信息
@@ -138,6 +147,11 @@ func (s *GraphQLScanner) SetIndex(store *index.Store) {
 // SetMaxHeight 动态更新最大块高度
 func (s *GraphQLScanner) SetMaxHeight(height uint64) {
 	atomic.StoreUint64(&s.maxHeight, height)
+}
+
+// SetOnMetaFound 设置元数据发现回调
+func (s *GraphQLScanner) SetOnMetaFound(fn OnMetaFound) {
+	s.onMetaFound = fn
 }
 
 // GetMaxHeight 获取当前最大块高度
@@ -404,6 +418,11 @@ func (s *GraphQLScanner) processMetadata(metaTxID string, blockHeight uint64) er
 
 	log.Info("GraphQL 扫描器：元数据已处理 root_cid=%s meta_txid=%s height=%d",
 		meta.RootCID, metaTxID, meta.DataHeight)
+
+	// 回调 Service 触发后续下载、完整验证、DHT 发布
+	if s.onMetaFound != nil {
+		s.onMetaFound(metaTxID, data, blockHeight)
+	}
 
 	return nil
 }
