@@ -7,15 +7,22 @@
 //	  1. 查本地 LRU 缓存 → 命中直接返回
 //	  2. 查第一层索引 (CID → metaTxID 列表)
 //	  3. 查第二层索引 (metaTxID → 参数: dataTxId, bundleTxId, blockHeight...)
-//	  4. 从 Arweave 按需下载
-//	  5. 写入缓存 → 返回数据
+//	  4. HTTP Range 分两阶段拉取 CAR 文件：
+//	     a. Range 读取 CAR v2 头部 (52 bytes) → IndexOffset + IndexSize
+//	     b. Range 读取 Index 段 → 解析 CID→offset 映射
+//	     c. Range 读取目标块数据 → 提取纯数据立即返回
+//	     d. [后台] 顺序下载完整 CAR → 验证 → 缓存所有块
+//	  5. 写入 LRU 缓存 → 返回数据
 package bridge
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
+
+	sdkcar "github.com/LWDJD/ipfar-sdk/verify/ipfs"
 
 	"github.com/lwdjd/IPFAR/internal/cache"
 	"github.com/lwdjd/IPFAR/internal/download"
@@ -239,28 +246,25 @@ func (bf *BlockFetcher) FetchBlock(ctx context.Context, cidStr string) ([]byte, 
 		}
 
 		dataTxID := params["dataTxId"]
-		bundleTxID := params["bundleTxId"]
-		blockHeightStr := params["blockHeight"]
+		dataSizeStr := params["dataSize"]
 
 		if dataTxID == "" {
 			continue
 		}
 
-		// Step 4: 从 Arweave 下载
+		// Step 4: 两阶段 CAR 拉取
 		bf.downloadSem <- struct{}{} // 获取并发槽位
 
-		var blockHeight int64
-		if blockHeightStr != "" {
-			fmt.Sscanf(blockHeightStr, "%d", &blockHeight)
-		}
+		data, lastErr = bf.fetchBlockViaCAR(ctx, dataTxID, cidStr)
 
-		data, lastErr = bf.downloadBlock(ctx, dataTxID, bundleTxID, blockHeight, cidStr)
 		<-bf.downloadSem // 释放槽位
 
 		if lastErr == nil && data != nil {
+			// Step 5: 后台 goroutine 下载完整 CAR 并缓存所有块
+			go bf.backgroundFullDownload(dataTxID, dataSizeStr, cidStr)
 			break
 		}
-		log.Debug("BlockFetcher：下载失败 metaTxID=%s dataTxID=%s: %v", metaTxID, dataTxID, lastErr)
+		log.Debug("BlockFetcher：CAR 拉取失败 metaTxID=%s dataTxID=%s: %v", metaTxID, dataTxID, lastErr)
 	}
 
 	if data == nil {
@@ -293,37 +297,175 @@ func (bf *BlockFetcher) FetchBlock(ctx context.Context, cidStr string) ([]byte, 
 	return data, nil
 }
 
-// downloadBlock 从 Arweave 下载指定 CID 对应的块数据
-func (bf *BlockFetcher) downloadBlock(ctx context.Context, dataTXID, bundleTXID string, blockHeight int64, cidStr string) ([]byte, error) {
-	if dataTXID == "" {
+// fetchBlockViaCAR 通过 HTTP Range 分阶段拉取 CAR 文件中的单个块
+//
+// 流程:
+//  1. HTTP Range 读取 CAR v2 头部（52 bytes）→ 获取 IndexOffset + IndexSize
+//  2. HTTP Range 读取 Index 段 → 解析 CID→offset 映射
+//  3. HTTP Range 读取目标块数据（~2MB 估算范围）→ 提取纯数据
+//
+// 不使用预存偏移，每次按需拉取 Index 并解析。
+func (bf *BlockFetcher) fetchBlockViaCAR(ctx context.Context, dataTxID, cidStr string) ([]byte, error) {
+	if dataTxID == "" {
 		return nil, fmt.Errorf("BlockFetcher: no data_txid for CID %s", cidStr)
 	}
 
-	if blockHeight == -1 && bundleTXID != "" && bundleTXID != "none" {
-		// 跨 Bundle 模式
-		_, rawData, err := bf.gateway.FetchBundleItemByID(bundleTXID, dataTXID)
-		if err != nil {
-			return nil, fmt.Errorf("BlockFetcher: fetch bundle item %s from bundle %s: %w",
-				dataTXID, bundleTXID, err)
-		}
-		return rawData, nil
-	} else if blockHeight == -1 && bundleTXID == "none" {
-		// 同 Bundle 模式：直接用 dataTXID 下载
-		return bf.downloadAsRaw(ctx, dataTXID)
+	log.Debug("BlockFetcher：两阶段 CAR 拉取 dataTxID=%s cid=%s", dataTxID, cidStr)
+
+	// Phase 1a: HTTP Range 读取 CAR v2 头部（前 52 bytes：4 字节魔数 + 48 字节头部）
+	headerBytes, err := bf.gateway.FetchRange(dataTxID, 0, 52)
+	if err != nil {
+		return nil, fmt.Errorf("BlockFetcher: fetch CAR v2 header for %s: %w", dataTxID, err)
 	}
 
-	// 普通模式：直接下载
-	return bf.downloadAsRaw(ctx, dataTXID)
+	// 验证 CAR v2 魔数
+	if len(headerBytes) < 4 || string(headerBytes[:4]) != "car\x02" {
+		return nil, fmt.Errorf("BlockFetcher: not a CAR v2 file (tx %s)", dataTxID)
+	}
+
+	// 解析 CAR v2 头部 (52 bytes, 4 字节魔数 + 48 字节头部)
+	if len(headerBytes) < 52 {
+		return nil, fmt.Errorf("BlockFetcher: CAR v2 header too short: %d bytes", len(headerBytes))
+	}
+
+	// 头部结构 (offset 4-51, 共 48 字节):
+	// Characteristics[16] + DataOffset[8] + DataSize[8] + IndexOffset[8] + IndexSize[8]
+	indexOffset := binary.LittleEndian.Uint64(headerBytes[4+32 : 4+40])
+	indexSize := binary.LittleEndian.Uint64(headerBytes[4+40 : 4+48])
+
+	if indexOffset == 0 || indexSize == 0 {
+		return nil, fmt.Errorf("BlockFetcher: CAR v2 has no index (tx %s)", dataTxID)
+	}
+
+	log.Debug("BlockFetcher：CAR v2 头部解析完成 index_offset=%d index_size=%d", indexOffset, indexSize)
+
+	// Phase 1b: HTTP Range 读取 Index 段
+	indexBytes, err := bf.gateway.FetchRange(dataTxID, int64(indexOffset), int64(indexSize))
+	if err != nil {
+		return nil, fmt.Errorf("BlockFetcher: fetch CAR v2 index for %s: %w", dataTxID, err)
+	}
+
+	// 解析 Index → CID→offset 映射
+	cidToOffset, err := sdkcar.ParseIndexData(indexBytes)
+	if err != nil {
+		return nil, fmt.Errorf("BlockFetcher: parse CAR index for %s: %w", dataTxID, err)
+	}
+
+	// Phase 1c: 查找目标 CID 的偏移量
+	blockOffset, found := cidToOffset[cidStr]
+	if !found {
+		return nil, fmt.Errorf("BlockFetcher: CID %s not found in CAR index (tx %s, %d entries)",
+			cidStr, dataTxID, len(cidToOffset))
+	}
+
+	log.Debug("BlockFetcher：找到 CID %s at offset=%d", cidStr, blockOffset)
+
+	// Phase 1d: HTTP Range 读取块数据（估算 ~2MB 范围，实际会被 CAR 格式限制）
+	// 使用较大的范围确保覆盖完整的块（最大 IPFS 块通常 < 2MB）
+	estimatedBlockSize := int64(2 * 1024 * 1024)
+	blockData, err := bf.gateway.FetchRange(dataTxID, int64(blockOffset), estimatedBlockSize)
+	if err != nil {
+		return nil, fmt.Errorf("BlockFetcher: fetch block data at offset %d for %s: %w", blockOffset, dataTxID, err)
+	}
+
+	// 从块数据中提取纯数据（去除 varint + CID 前缀）
+	pureData, err := sdkcar.ExtractBlockFromCar(blockData, 0)
+	if err != nil {
+		return nil, fmt.Errorf("BlockFetcher: extract block from CAR for CID %s: %w", cidStr, err)
+	}
+
+	log.Debug("BlockFetcher：提取块成功 %s (%d bytes)", cidStr, len(pureData))
+
+	return pureData, nil
 }
 
-// downloadAsRaw 直接下载交易数据
-func (bf *BlockFetcher) downloadAsRaw(ctx context.Context, txID string) ([]byte, error) {
-	log.Debug("BlockFetcher：直接下载交易 %s", txID)
-	data, err := bf.gateway.FetchRaw(txID)
+// backgroundFullDownload 后台下载完整 CAR 文件，验证完整性，并缓存所有块
+//
+// 在随机读取返回数据后异步执行，不阻塞 Bitswap 响应。
+func (bf *BlockFetcher) backgroundFullDownload(dataTxID, dataSizeStr, cidStr string) {
+	ctx := context.Background()
+	log.Debug("BlockFetcher：后台开始完整下载 CAR dataTxID=%s", dataTxID)
+
+	// 下载完整 CAR 文件
+	fullData, err := bf.gateway.FetchRaw(dataTxID)
 	if err != nil {
-		return nil, fmt.Errorf("BlockFetcher: download tx %s: %w", txID, err)
+		log.Warn("BlockFetcher：后台完整下载失败 dataTxID=%s: %v", dataTxID, err)
+		return
 	}
-	return data, nil
+
+	log.Debug("BlockFetcher：后台完整下载完成 dataTxID=%s (%d bytes)", dataTxID, len(fullData))
+
+	// 解析完整 CAR 中的所有块并缓存
+	// 使用 CAR 解析器提取所有块
+	// 注意：这里通过 bytes.Reader 实现 io.ReaderAt
+	carParser, err := sdkcar.NewCarParserFromReader(
+		&readerAtAdapter{data: fullData},
+		int64(len(fullData)),
+	)
+	if err != nil {
+		log.Warn("BlockFetcher：后台创建 CAR 解析器失败: %v", err)
+		return
+	}
+	defer carParser.Close()
+
+	// 获取索引中的所有块并缓存
+	entries, err := carParser.ParseIndex()
+	if err != nil {
+		// 回退：顺序扫描所有块
+		log.Debug("BlockFetcher：后台无法解析索引，使用顺序扫描")
+		err = carParser.IterateBlocks(func(block *sdkcar.Block) error {
+			if bf.cache != nil {
+				cidKey := block.CID.String()
+				if putErr := bf.cache.Put(cidKey, block.Data); putErr != nil {
+					log.Warn("BlockFetcher：后台缓存写入失败 %s: %v", cidKey, putErr)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			log.Warn("BlockFetcher：后台顺序扫描失败: %v", err)
+		}
+		return
+	}
+
+	// 使用索引逐块读取并缓存
+	for _, entry := range entries {
+		block, err := carParser.GetBlock(entry.CID)
+		if err != nil || block == nil {
+			continue
+		}
+		if bf.cache != nil {
+			cidKey := block.CID.String()
+			if putErr := bf.cache.Put(cidKey, block.Data); putErr != nil {
+				log.Warn("BlockFetcher：后台缓存写入失败 %s: %v", cidKey, putErr)
+			}
+		}
+	}
+
+	_ = ctx
+	_ = dataSizeStr
+	_ = cidStr
+
+	log.Info("BlockFetcher：后台缓存完成 dataTxID=%s，已缓存 %d 个块", dataTxID, len(entries))
+}
+
+// readerAtAdapter 实现 io.ReaderAt 接口，适配字节切片
+type readerAtAdapter struct {
+	data []byte
+}
+
+func (r *readerAtAdapter) ReadAt(p []byte, off int64) (n int, err error) {
+	if off < 0 {
+		return 0, fmt.Errorf("negative offset")
+	}
+	if off >= int64(len(r.data)) {
+		return 0, fmt.Errorf("EOF")
+	}
+	n = copy(p, r.data[off:])
+	if n < len(p) {
+		return n, fmt.Errorf("EOF")
+	}
+	return n, nil
 }
 
 // Stats 返回统计信息

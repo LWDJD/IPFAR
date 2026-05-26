@@ -33,23 +33,30 @@ type CacheConfig struct {
 	Dir string
 	// MaxSize 最大缓存大小（字节），0 表示无限制
 	MaxSize int64
+	// ProtectionDuration 缓存保护期（写入/读取后多久内不被驱逐），0 表示无保护
+	ProtectionDuration time.Duration
 }
 
-// DefaultCacheConfig 返回默认缓存配置（500 MB）
+// DefaultCacheConfig 返回默认缓存配置（500 MB，10 分钟保护期）
 func DefaultCacheConfig() CacheConfig {
 	return CacheConfig{
-		Dir:     "cache/ipfar",
-		MaxSize: 500 * 1024 * 1024, // 500 MB
+		Dir:                "cache/ipfar",
+		MaxSize:            500 * 1024 * 1024, // 500 MB
+		ProtectionDuration: 10 * time.Minute,
 	}
 }
 
 // entryMeta 缓存条目元数据（写入索引文件）
 type entryMeta struct {
-	Key        string    `json:"key"`
-	FilePath    string    `json:"file_path"`
-	Size       int64     `json:"size"`
-	LastAccess time.Time `json:"last_access"`
+	Key            string    `json:"key"`
+	FilePath       string    `json:"file_path"`
+	Size           int64     `json:"size"`
+	LastAccess     time.Time `json:"last_access"`
+	ProtectedUntil time.Time `json:"protected_until"`
 }
+
+// ErrCacheFull 缓存已满且无可驱逐条目
+var ErrCacheFull = fmt.Errorf("cache full: all entries are within protection period")
 
 // lruNode LRU 双向链表节点
 type lruNode struct {
@@ -62,6 +69,8 @@ type lruNode struct {
 type Cache struct {
 	dir     string
 	maxSize int64
+
+	protectionDuration time.Duration // 保护期时长（0 表示无保护）
 
 	mu      sync.RWMutex
 	entries map[string]*entryMeta // key → entry
@@ -94,9 +103,10 @@ func New(config CacheConfig) (*Cache, error) {
 	}
 
 	c := &Cache{
-		dir:     dir,
-		maxSize: config.MaxSize,
-		entries: make(map[string]*entryMeta),
+		dir:                dir,
+		maxSize:            config.MaxSize,
+		protectionDuration: config.ProtectionDuration,
+		entries:            make(map[string]*entryMeta),
 	}
 
 	// 尝试加载已有索引
@@ -142,14 +152,20 @@ func (c *Cache) Put(key string, data []byte) error {
 
 	// 如果设置了大小限制，淘汰直到有足够空间
 	if c.maxSize > 0 && c.currentSize+dataSize > c.maxSize {
-		c.evictLocked(c.currentSize + dataSize - c.maxSize)
+		if err := c.evictLocked(c.currentSize + dataSize - c.maxSize); err != nil {
+			// 无法驱逐足够的空间（所有条目都在保护期内）
+			os.Remove(filePath) // 清理刚写入的文件
+			return err
+		}
 	}
 
+	protectedUntil := time.Now().Add(c.protectionDuration)
 	entry := &entryMeta{
-		Key:        key,
-		FilePath:    filePath,
-		Size:       dataSize,
-		LastAccess: time.Now(),
+		Key:            key,
+		FilePath:       filePath,
+		Size:           dataSize,
+		LastAccess:     time.Now(),
+		ProtectedUntil: protectedUntil,
 	}
 
 	c.entries[key] = entry
@@ -279,8 +295,9 @@ func (c *Cache) getEntry(key string) (*entryMeta, bool) {
 		return nil, false
 	}
 
-	// 更新访问时间和 LRU
+	// 更新访问时间和保护期
 	entry.LastAccess = time.Now()
+	entry.ProtectedUntil = time.Now().Add(c.protectionDuration)
 	c.lruMoveToBackLocked(key)
 	c.hits++
 	c.dirty = true
@@ -303,8 +320,17 @@ func (c *Cache) removeEntryLocked(key string, entry *entryMeta) error {
 }
 
 // evictLocked 驱逐条目直到释放至少 targetBytes 空间
-func (c *Cache) evictLocked(targetBytes int64) {
+// 跳过保护期内的条目；如果所有条目都在保护期内，返回 ErrCacheFull
+func (c *Cache) evictLocked(targetBytes int64) error {
+	now := time.Now()
 	var evictedSize int64
+	totalEntries := len(c.entries)
+	if totalEntries == 0 {
+		return nil
+	}
+
+	skippedInARow := 0
+
 	for c.lruHead != nil && evictedSize < targetBytes {
 		oldestKey := c.lruHead.key
 		entry, ok := c.entries[oldestKey]
@@ -312,6 +338,20 @@ func (c *Cache) evictLocked(targetBytes int64) {
 			c.lruRemoveLocked(oldestKey)
 			continue
 		}
+
+		// 跳过保护期内的条目
+		if entry.ProtectedUntil.After(now) {
+			// 移到链表尾部
+			c.lruMoveToBackLocked(oldestKey)
+			skippedInARow++
+			// 如果跳过的数量 >= 总条目数，说明全部受保护
+			if skippedInARow >= totalEntries {
+				return ErrCacheFull
+			}
+			continue
+		}
+
+		skippedInARow = 0 // 重置计数器
 
 		if err := os.Remove(entry.FilePath); err != nil && !os.IsNotExist(err) {
 			log.Warn("缓存：驱逐删除文件失败 %s: %v", entry.FilePath, err)
@@ -322,9 +362,12 @@ func (c *Cache) evictLocked(targetBytes int64) {
 		c.currentSize -= entry.Size
 		c.evictions++
 		c.lruRemoveLocked(oldestKey)
+		totalEntries-- // 更新计数
 
 		log.Debug("缓存：驱逐 key=%s size=%d evicted_total=%d", oldestKey, entry.Size, evictedSize)
 	}
+
+	return nil
 }
 
 // filePath 生成缓存文件路径
