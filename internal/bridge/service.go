@@ -122,11 +122,6 @@ func (c *ServiceConfig) getVerifyConfig() pipeline.VerifyConfig {
 		}
 	}
 
-	// spec §3.4: Index always enforced — 至少保证 Index=true
-	if !verifyIndex {
-		verifyIndex = true
-	}
-
 	return pipeline.VerifyConfig{
 		VerifyPoW:            verifyPoW,
 		VerifyIndex:          verifyIndex,
