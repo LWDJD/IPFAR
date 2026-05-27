@@ -37,11 +37,11 @@ type CacheConfig struct {
 	ProtectionDuration time.Duration
 }
 
-// DefaultCacheConfig 返回默认缓存配置（500 MB，10 分钟保护期）
+// DefaultCacheConfig 返回默认缓存配置（10 GiB，10 分钟保护期）
 func DefaultCacheConfig() CacheConfig {
 	return CacheConfig{
 		Dir:                "cache/ipfar",
-		MaxSize:            500 * 1024 * 1024, // 500 MB
+		MaxSize:            10 * 1024 * 1024 * 1024, // 10 GiB
 		ProtectionDuration: 10 * time.Minute,
 	}
 }
@@ -128,14 +128,26 @@ func (c *Cache) Put(key string, data []byte) error {
 		return fmt.Errorf("缓存键不能为空")
 	}
 
+	neededSize := int64(len(data))
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 如果已存在，先删除旧条目
+	// 如果单个文件大小超过缓存总大小，直接拒绝
+	if c.maxSize > 0 && neededSize > c.maxSize {
+		return fmt.Errorf("%w: item size %d exceeds cache max size %d", ErrCacheFull, neededSize, c.maxSize)
+	}
+
+	// 如果已存在，先删除旧条目（释放其占用的空间，避免重复计算）
 	if old, ok := c.entries[key]; ok {
 		if err := c.removeEntryLocked(key, old); err != nil {
 			log.Warn("缓存：删除旧条目失败 key=%s: %v", key, err)
 		}
+	}
+
+	// 尝试驱逐腾出空间（在写文件之前）
+	if err := c.evictIfNeededLocked(neededSize); err != nil {
+		return err // 满且无可驱逐时返回 ErrCacheFull
 	}
 
 	// 写入文件
@@ -148,35 +160,24 @@ func (c *Cache) Put(key string, data []byte) error {
 		return fmt.Errorf("写入缓存文件失败: %w", err)
 	}
 
-	dataSize := int64(len(data))
-
-	// 如果设置了大小限制，淘汰直到有足够空间
-	if c.maxSize > 0 && c.currentSize+dataSize > c.maxSize {
-		if err := c.evictLocked(c.currentSize + dataSize - c.maxSize); err != nil {
-			// 无法驱逐足够的空间（所有条目都在保护期内）
-			os.Remove(filePath) // 清理刚写入的文件
-			return err
-		}
-	}
-
 	protectedUntil := time.Now().Add(c.protectionDuration)
 	entry := &entryMeta{
 		Key:            key,
 		FilePath:       filePath,
-		Size:           dataSize,
+		Size:           neededSize,
 		LastAccess:     time.Now(),
 		ProtectedUntil: protectedUntil,
 	}
 
 	c.entries[key] = entry
-	c.currentSize += dataSize
+	c.currentSize += neededSize
 	c.totalEntries++
 	c.dirty = true
 
 	// 添加到 LRU 链表尾部
 	c.lruPushBackLocked(key)
 
-	log.Debug("缓存：写入 key=%s size=%d current_size=%d", key, dataSize, c.currentSize)
+	log.Debug("缓存：写入 key=%s size=%d current_size=%d", key, neededSize, c.currentSize)
 
 	// 异步保存索引
 	go c.saveIndex()
@@ -317,6 +318,22 @@ func (c *Cache) removeEntryLocked(key string, entry *entryMeta) error {
 	c.dirty = true
 
 	return nil
+}
+
+// evictIfNeededLocked 检查是否需要驱逐空间，需要时执行驱逐
+// 调用者必须持有 mu 写锁
+func (c *Cache) evictIfNeededLocked(neededSize int64) error {
+	if c.maxSize <= 0 {
+		return nil // 无大小限制
+	}
+
+	if c.currentSize+neededSize <= c.maxSize {
+		return nil // 空间足够
+	}
+
+	// 计算需要释放的空间
+	needFree := c.currentSize + neededSize - c.maxSize
+	return c.evictLocked(needFree)
 }
 
 // evictLocked 驱逐条目直到释放至少 targetBytes 空间

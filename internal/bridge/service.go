@@ -89,7 +89,7 @@ func DefaultServiceConfig() ServiceConfig {
 		MaxFileSize:            0, // 不限制
 		BitswapEnabled:         true,
 		BitswapPort:            4001,
-		CacheSize:              1 << 30, // 1 GB
+		CacheSize:              10 * 1024 * 1024 * 1024, // 10 GiB
 		CarAvailable:           false,   // 按需拉取模式，不预下载
 		OnlineVerify:           false,
 		OnlineSampleCount:      5,
