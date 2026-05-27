@@ -311,6 +311,7 @@ func TestService_Stats(t *testing.T) {
 		"data_txid": "txstatstesttxid1234567890123456789012345678901234",
 		"data_height": 100,
 		"data_size": 99999999,
+		"bundle_txid": "bundle_txid_stats_test_12345678901234567890",
 		"pow": "statssalt",
 		"pow_alg": "argon2idlightv1"
 	}`
