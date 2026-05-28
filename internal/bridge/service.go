@@ -814,6 +814,7 @@ func (s *Service) ProcessMetadataTX(txID string) (*PipelineResult, error) {
 
 // processMetadataTX 处理元数据交易（内部实现）
 func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
+	log.Debug("processMetadataTX：开始处理 txID=%s", txID)
 	log.Info("桥接服务：处理元数据交易 %s", txID)
 
 	// 获取验证配置
@@ -821,6 +822,8 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 
 	// Step 0: 按步骤验证缓存检查
 	if s.indexStore != nil {
+		log.Debug("验证缓存检查：txID=%s 步骤=[pow=%v, index=%v, ref_chain=%v, integrity=%v]",
+			txID, vcfg.VerifyPoW, vcfg.VerifyIndex, vcfg.VerifyReferenceChain, vcfg.VerifyIntegrity)
 		if s.allStepsCached(txID, vcfg) {
 			log.Info("桥接服务：元数据所有步骤已验证通过，跳过 pipeline txID=%s", txID)
 			return &PipelineResult{
@@ -882,11 +885,14 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 	// Step 3: 选择验证路径
 	var result *PipelineResult
 	if s.config.OnlineVerify && meta.DataTXID != "" {
+		log.Debug("路径选择：onlineVerify=%v → 路径 A（在线验证）", s.config.OnlineVerify)
 		result, _ = s.processOnlineVerify(meta, quickResult)
 	} else if s.config.CarAvailable {
+		log.Debug("路径选择：onlineVerify=%v → 路径 B（完整下载）", s.config.OnlineVerify)
 		result, _ = s.processFullDownload(meta, quickResult)
 	} else {
 		// 两条路径都未启用，仅返回快速验证结果
+		log.Debug("路径选择：onlineVerify=%v → 路径 仅快速验证", s.config.OnlineVerify)
 		s.mu.Lock()
 		if quickResult.Passed {
 			s.stats.PipelinesPassed++
@@ -1117,6 +1123,11 @@ func (s *Service) processFullDownload(meta *sdkmeta.Metadata, quickResult *pipel
 			QuickOnly:  true,
 			VerifyMode: "download",
 		}, nil
+	}
+
+	// 读取 CAR 文件大小用于调试日志
+	if carInfo, statErr := os.Stat(carPath); statErr == nil {
+		log.Debug("CAR 下载完成：size=%d bytes path=%s", carInfo.Size(), carPath)
 	}
 
 	s.mu.Lock()
@@ -1506,6 +1517,7 @@ func (s *Service) indexMetadataCIDs(metadataTxID string, meta *sdkmeta.Metadata)
 
 	// 第一层：索引 RootCID → metaTxID
 	if meta.RootCID != "" {
+		log.Debug("两层索引：写入 CID=%s meta=%s", meta.RootCID, metadataTxID)
 		if err := s.indexStore.IndexCID(meta.RootCID, metadataTxID); err != nil {
 			log.Warn("桥接服务：索引 RootCID 失败 %s: %v", meta.RootCID, err)
 		} else {

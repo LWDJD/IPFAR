@@ -54,12 +54,15 @@ func (b *Bridge) GetGatewayClient() *arweave.GatewayClient {
 // VerifyMetadata 验证元数据 JSON
 // 解析并验证元数据的合法性（必填字段、类型、条件字段等）
 func (b *Bridge) VerifyMetadata(jsonData []byte) (*metadata.Metadata, error) {
+	log.Debug("元数据验证：开始解析 JSON 元数据")
+
 	meta, err := metadata.ParseAndValidate(jsonData)
 	if err != nil {
 		log.Warn("元数据验证失败：%v", err)
 		return nil, fmt.Errorf("metadata validation failed: %w", err)
 	}
 
+	log.Debug("元数据验证：通过 root_cid=%s", meta.RootCID)
 	log.Info("元数据验证通过：root_cid=%s, data_txid=%s, data_size=%d",
 		meta.RootCID, meta.DataTXID, meta.DataSize)
 
@@ -68,12 +71,15 @@ func (b *Bridge) VerifyMetadata(jsonData []byte) (*metadata.Metadata, error) {
 
 // VerifyMetadataFromBase64 从 Base64URL 编码的字符串验证元数据
 func (b *Bridge) VerifyMetadataFromBase64(encoded string) (*metadata.Metadata, error) {
+	log.Debug("元数据验证（Base64URL）：开始解析")
+
 	meta, err := metadata.ParseAndValidateBase64URL(encoded)
 	if err != nil {
 		log.Warn("元数据验证失败（Base64URL）：%v", err)
 		return nil, fmt.Errorf("metadata validation failed: %w", err)
 	}
 
+	log.Debug("元数据验证（Base64URL）：通过 root_cid=%s", meta.RootCID)
 	log.Info("元数据验证通过（Base64URL）：root_cid=%s", meta.RootCID)
 
 	return meta, nil
@@ -84,6 +90,12 @@ func (b *Bridge) VerifyMetadataFromBase64(encoded string) (*metadata.Metadata, e
 func (b *Bridge) VerifyPoW(meta *metadata.Metadata) error {
 	if meta == nil {
 		return fmt.Errorf("metadata is nil")
+	}
+
+	log.Debug("PoW 验证：root_cid=%s data_size=%d threshold=%d needsPow=%v",
+		meta.RootCID, meta.DataSize, 100*1024*1024, meta.NeedsPoW())
+	if meta.NeedsPoW() {
+		log.Debug("PoW 验证：执行 argon2id(密码=root_cid+data_txid, salt=%s)", meta.PoW)
 	}
 
 	err := pow.Verify(meta.PoW, meta.PoWAlg, meta.RootCID, meta.DataTXID, int64(meta.DataSize))
@@ -105,6 +117,8 @@ func (b *Bridge) VerifyPoW(meta *metadata.Metadata) error {
 // RunPipeline 运行完整验证管道
 // carAvailable 表示 CAR 文件是否已经下载可用
 func (b *Bridge) RunPipeline(meta *metadata.Metadata, carAvailable bool) *pipeline.PipelineResult {
+	log.Debug("Pipeline 开始：root_cid=%s carAvailable=%v config=%+v", meta.RootCID, carAvailable, b.config)
+
 	p := pipeline.NewPipeline(b.config)
 
 	// 注入网关客户端（用于引用链验证等网络操作）
@@ -124,6 +138,19 @@ func (b *Bridge) RunPipeline(meta *metadata.Metadata, carAvailable bool) *pipeli
 	})
 
 	result := p.Verify(meta, carAvailable)
+
+	// 记录每个步骤的详细结果
+	for _, r := range result.Results {
+		if r.Skipped {
+			log.Debug("Pipeline 步骤：%s → 跳过 (%s)", r.Step, r.Message)
+		} else if r.Passed {
+			log.Debug("Pipeline 步骤：%s → 通过", r.Step)
+		} else {
+			log.Debug("Pipeline 步骤：%s → 失败 (%s)", r.Step, r.Error)
+		}
+	}
+
+	log.Debug("Pipeline 完成：passed=%v steps=%d", result.Passed, len(result.Results))
 
 	// 记录结果
 	if result.Passed {

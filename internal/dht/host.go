@@ -308,6 +308,16 @@ func loadOrGenerateKeyFile(keyPath string) (crypto.PrivKey, error) {
 			return nil, fmt.Errorf("解析密钥文件 %s 失败: 无效的 PEM 格式", keyPath)
 		}
 
+		// 支持 "ED25519 PRIVATE KEY" 格式（由 ipfar init 生成，protobuf 编码）
+		if block.Type == "ED25519 PRIVATE KEY" {
+			privKey, err := crypto.UnmarshalPrivateKey(block.Bytes)
+			if err != nil {
+				return nil, fmt.Errorf("解析 ED25519 私钥失败 %s: %w", keyPath, err)
+			}
+			log.Info("DHT Host: 已从文件加载节点私钥 path=%s", keyPath)
+			return privKey, nil
+		}
+
 		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if err != nil {
 			return nil, fmt.Errorf("解析 PKCS8 私钥失败 %s: %w", keyPath, err)
