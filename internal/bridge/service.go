@@ -189,6 +189,9 @@ type ServiceStats struct {
 
 // NewService 创建新的桥接服务
 func NewService(cfg ServiceConfig) (*Service, error) {
+	// 按需拉取模式：始终不预下载 CAR，CAR 下载由 Bitswap 按需触发
+	cfg.CarAvailable = false
+
 	// 解析安全预设
 	verifyPoW := cfg.VerifyPoW
 	verifyIndex := cfg.VerifyIndex
@@ -814,8 +817,18 @@ func (s *Service) ProcessMetadataTX(txID string) (*PipelineResult, error) {
 	return s.processMetadataTX(txID)
 }
 
+// processingTXIDs 正在处理的 txID 集合，防止重复处理
+var processingTXIDs sync.Map // txID → bool
+
 // processMetadataTX 处理元数据交易（内部实现）
 func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
+	// 防重复处理：正在处理的 txID 不再触发第二次
+	if _, loaded := processingTXIDs.LoadOrStore(txID, true); loaded {
+		log.Debug("桥接服务：跳过已正在处理的 txID=%s", txID)
+		return nil, nil
+	}
+	defer processingTXIDs.Delete(txID)
+
 	log.Debug("processMetadataTX：开始处理 txID=%s", txID)
 	log.Info("桥接服务：处理元数据交易 %s", txID)
 
@@ -884,17 +897,19 @@ func (s *Service) processMetadataTX(txID string) (*PipelineResult, error) {
 		}, nil
 	}
 
+	// DHT 发布：索引完成后立即发布所有 CID
+	s.dhtProvideMetaCIDs(meta)
+
 	// Step 3: 选择验证路径
+	// 按需拉取模式：不预下载 CAR，只做轻量验证和索引
+	// CAR 下载和完整验证在 Bitswap 请求时由 BlockFetcher 触发
 	var result *PipelineResult
 	if s.config.OnlineVerify && meta.DataTXID != "" {
 		log.Debug("路径选择：onlineVerify=%v → 路径 A（在线验证）", s.config.OnlineVerify)
 		result, _ = s.processOnlineVerify(meta, quickResult)
-	} else if s.config.CarAvailable {
-		log.Debug("路径选择：onlineVerify=%v → 路径 B（完整下载）", s.config.OnlineVerify)
-		result, _ = s.processFullDownload(meta, quickResult)
 	} else {
-		// 两条路径都未启用，仅返回快速验证结果
-		log.Debug("路径选择：onlineVerify=%v → 路径 仅快速验证", s.config.OnlineVerify)
+		// 按需拉取：仅快速验证 + 索引，不下载 CAR
+		log.Debug("路径选择：onlineVerify=%v → 路径 仅快速验证（按需拉取模式，CAR 下载由 Bitswap 触发）", s.config.OnlineVerify)
 		s.mu.Lock()
 		if quickResult.Passed {
 			s.stats.PipelinesPassed++
@@ -1101,6 +1116,43 @@ func (s *Service) dhtProvideCID(rootCIDStr string) {
 			}
 			if err := s.dhtProvider.Provide(rootCID); err != nil {
 				log.Warn("桥接服务：DHT Provide 失败 %s: %v", rootCIDStr, err)
+			}
+		}()
+	}
+}
+
+// dhtProvideMetaCIDs 从元数据中提取所有 CID 并通过 DHT 发布
+// 在索引完成后调用，确保 DHT 网络能发现这些 CID
+func (s *Service) dhtProvideMetaCIDs(meta *sdkmeta.Metadata) {
+	if s.dhtProvider == nil || !s.dhtProvider.IsStarted() {
+		log.Warn("桥接服务：DHT Provider 未启动，跳过 CID 发布")
+		return
+	}
+
+	// 收集所有 CID：RootCID + 引用 CID
+	var cidStrs []string
+	if meta.RootCID != "" {
+		cidStrs = append(cidStrs, meta.RootCID)
+	}
+	if meta.HasReference() {
+		refMap := *meta.Reference
+		for _, entry := range refMap {
+			cidStrs = append(cidStrs, entry.CIDs...)
+		}
+	}
+
+	for _, cidStr := range cidStrs {
+		cidStr := cidStr
+		go func() {
+			parsedCID, err := cid.Decode(cidStr)
+			if err != nil {
+				log.Warn("桥接服务：无法解析 CID %q 用于 DHT 发布: %v", cidStr, err)
+				return
+			}
+			if err := s.dhtProvider.Provide(parsedCID); err != nil {
+				log.Warn("桥接服务：DHT Provide 失败 %s: %v", cidStr, err)
+			} else {
+				log.Debug("桥接服务：DHT 已发布 CID %s", cidStr)
 			}
 		}()
 	}
