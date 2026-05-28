@@ -382,6 +382,7 @@ func RegisterCommands() {
 				DHTMode:                dhtMode,
 				DHTReprovideInterval:   dhtReprovide,
 				DHTProvideConcurrency:  dhtConcurrency,
+				BitswapEnabled:         true,
 				ScanBatchSize:          scanBatch,
 				ScanQueryDelay:         time.Duration(scanDelayMs) * time.Millisecond,
 			}
