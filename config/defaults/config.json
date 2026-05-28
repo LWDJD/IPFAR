@@ -3,5 +3,10 @@
   "log_level": "info",
   "log_file": "logs/ipfar.log",
   "log_to_console": true,
-  "log_format": "text"
+  "log_format": "text",
+  "dht": {
+    "enabled": true,
+    "mode": "server",
+    "listen_addresses": ["/ip4/0.0.0.0/tcp/4001"]
+  }
 }

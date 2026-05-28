@@ -100,6 +100,8 @@ func DefaultServiceConfig() ServiceConfig {
 		DownloadMaxConcurrency: 2,
 		ScanBatchSize:          100,
 		ScanQueryDelay:         2 * time.Second,
+		DHTEnabled:             true,
+		DHTListenAddresses:     []string{"/ip4/0.0.0.0/tcp/4001"},
 	}
 }
 
