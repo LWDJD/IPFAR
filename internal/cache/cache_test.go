@@ -524,7 +524,7 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.Dir != "cache/ipfar" {
 		t.Errorf("默认 Dir 应为 cache/ipfar，实际 %s", cfg.Dir)
 	}
-	if cfg.MaxSize != 500*1024*1024 {
-		t.Errorf("默认 MaxSize 应为 500 MB，实际 %d", cfg.MaxSize)
+	if cfg.MaxSize != 10*1024*1024*1024 {
+		t.Errorf("默认 MaxSize 应为 10 GiB，实际 %d", cfg.MaxSize)
 	}
 }
