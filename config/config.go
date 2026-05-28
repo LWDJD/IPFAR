@@ -11,8 +11,9 @@ type Config struct {
 	Language     string `json:"language"`
 	LogLevel     string `json:"log_level,omitempty"`      // 日志级别：debug, info, warn, error
 	LogFile      string `json:"log_file,omitempty"`       // 日志文件路径（可选）
-	LogToConsole bool   `json:"log_to_console,omitempty"` // 是否输出到控制台（默认 false）
+	LogToConsole bool   `json:"log_to_console,omitempty"` // 是否输出到控制台（默认 true）
 	LogFormat    string `json:"log_format,omitempty"`     // 日志格式：text, json
+	Debug        bool   `json:"debug,omitempty"`          // debug 模式，开启后日志级别设为 debug
 
 	// 验证选项（规范 §4.1）
 	VerifyPoW            bool `json:"verify_pow,omitempty"`             // PoW 验证开关
@@ -73,9 +74,14 @@ func InitLog() error {
 		return log.Init(log.Config{
 			Level:      log.INFO,
 			FilePath:   "",
-			UseConsole: false,
+			UseConsole: true,
 			UseJSON:    false,
 		})
+	}
+
+	// Debug 模式覆写日志级别
+	if ConfigFile.Debug {
+		ConfigFile.LogLevel = "debug"
 	}
 
 	// 解析日志级别

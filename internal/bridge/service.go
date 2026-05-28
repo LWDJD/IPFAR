@@ -75,6 +75,9 @@ type ServiceConfig struct {
 	// GraphQL 扫描配置（graphql-scan 模式）
 	ScanBatchSize  int           // 每批扫描块数（默认 100）
 	ScanQueryDelay time.Duration // 批次间延迟（默认 2s）
+
+	// Debug 模式，开启后日志级别设为 debug
+	Debug bool `json:"debug,omitempty"`
 }
 
 // DefaultServiceConfig 返回默认服务配置
@@ -350,8 +353,8 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		}
 	}
 
-	log.Info("桥接服务：初始化完成 preset=%s verify_pow=%v verify_index=%v verify_ref=%v verify_integrity=%v online_verify=%v dht=%v discovery=%s",
-		cfg.Preset, verifyPoW, verifyIndex, verifyRef, verifyIntegrity, cfg.OnlineVerify, cfg.DHTEnabled && svc.dhtProvider != nil, cfg.DiscoveryMode)
+	log.Info("桥接服务：初始化完成 preset=%s verify_pow=%v verify_index=%v verify_ref=%v verify_integrity=%v online_verify=%v dht=%v discovery=%s debug=%v",
+		cfg.Preset, verifyPoW, verifyIndex, verifyRef, verifyIntegrity, cfg.OnlineVerify, cfg.DHTEnabled && svc.dhtProvider != nil, cfg.DiscoveryMode, cfg.Debug)
 
 	return svc, nil
 }

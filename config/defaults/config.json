@@ -2,6 +2,6 @@
   "language": "en_US",
   "log_level": "info",
   "log_file": "logs/ipfar.log",
-  "log_to_console": false,
+  "log_to_console": true,
   "log_format": "text"
 }
