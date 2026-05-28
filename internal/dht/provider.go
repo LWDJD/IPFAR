@@ -156,6 +156,8 @@ func NewProvider(host host.Host, cfg Config) (*Provider, error) {
 		provideSema:  make(chan struct{}, cfg.ProvideConcurrency),
 	}
 
+	log.Debug("DHT Provider：创建成功 mode=%s bootstrap_peers=%d", cfg.Mode, len(cfg.BootstrapPeers))
+
 	return p, nil
 }
 
@@ -213,9 +215,11 @@ func (p *Provider) Start() error {
 	p.dht = d
 
 	// 启动 DHT bootstrap
+	log.Debug("DHT Provider：开始连接引导节点...")
 	if err := p.dht.Bootstrap(p.ctx); err != nil {
 		log.Warn("DHT Provider: Bootstrap 失败（非致命）: %v", err)
 	}
+	log.Debug("DHT Provider：引导节点连接完成")
 
 	p.started.Store(true)
 
@@ -287,8 +291,10 @@ func (p *Provider) Provide(c cid.Cid) error {
 	}
 
 	// 执行提供
+	log.Debug("DHT Provide：开始发布 CID=%s", c.String())
 	err := p.doProvide(c)
 	if err != nil {
+		log.Debug("DHT Provide：发布失败 CID=%s error=%v", c.String(), err)
 		log.Warn("DHT Provider: Provide 失败 %s: %v", c, err)
 		p.stats.mu.Lock()
 		p.stats.TotalFailed++
@@ -299,6 +305,8 @@ func (p *Provider) Provide(c cid.Cid) error {
 		p.enqueueRetry(c)
 		return err
 	}
+
+	log.Debug("DHT Provide：发布成功 CID=%s", c.String())
 
 	// 注册成功
 	p.registerCID(c)
@@ -423,6 +431,7 @@ func (p *Provider) reprovideAll() {
 	}
 
 	log.Info("DHT Provider: 开始 re-provide count=%d", len(cids))
+	log.Debug("DHT Reprovide：开始重新提供 %d 个 CID", len(cids))
 
 	// 使用信号量控制并发
 	sem := make(chan struct{}, p.cfg.ProvideConcurrency)
@@ -462,6 +471,7 @@ func (p *Provider) reprovideAll() {
 
 	log.Info("DHT Provider: re-provide 完成 success=%d failed=%d total=%d",
 		successCount.Load(), failCount.Load(), len(cids))
+	log.Debug("DHT Reprovide：完成")
 
 	p.stats.mu.Lock()
 	p.stats.TotalProvided += successCount.Load()
@@ -495,6 +505,8 @@ func (p *Provider) retryProvide(c cid.Cid, attempt int) {
 		log.Warn("DHT Provider: 已达最大重试次数 max=%d cid=%s", p.cfg.RetryMaxAttempts, c)
 		return
 	}
+
+	log.Debug("DHT 重试：重试 CID=%s 第 %d 次", c, attempt)
 
 	// 计算退避延迟
 	delay := p.cfg.RetryBaseDelay * time.Duration(1<<uint(attempt))

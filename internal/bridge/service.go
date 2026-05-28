@@ -1125,7 +1125,7 @@ func (s *Service) dhtProvideCID(rootCIDStr string) {
 // 在索引完成后调用，确保 DHT 网络能发现这些 CID
 func (s *Service) dhtProvideMetaCIDs(meta *sdkmeta.Metadata) {
 	if s.dhtProvider == nil || !s.dhtProvider.IsStarted() {
-		log.Warn("桥接服务：DHT Provider 未启动，跳过 CID 发布")
+		log.Debug("DHT 发布：跳过，DHT Provider 未启动")
 		return
 	}
 
@@ -1140,6 +1140,12 @@ func (s *Service) dhtProvideMetaCIDs(meta *sdkmeta.Metadata) {
 			cidStrs = append(cidStrs, entry.CIDs...)
 		}
 	}
+
+	refCount := len(cidStrs)
+	if meta.RootCID != "" {
+		refCount = len(cidStrs) - 1 // 排除 RootCID 自身
+	}
+	log.Debug("DHT 发布：开始发布元数据 CID root_cid=%s 引用数=%d", meta.RootCID, refCount)
 
 	for _, cidStr := range cidStrs {
 		cidStr := cidStr
@@ -1156,6 +1162,8 @@ func (s *Service) dhtProvideMetaCIDs(meta *sdkmeta.Metadata) {
 			}
 		}()
 	}
+
+	log.Debug("DHT 发布：RootCID=%s 已提交发布", meta.RootCID)
 }
 
 // processFullDownload 路径 B：完整下载 CAR 文件
