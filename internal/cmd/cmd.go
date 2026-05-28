@@ -311,6 +311,7 @@ func RegisterCommands() {
 	serveFlagSet.DefineInt("min-height", "", 1919626, "最小扫描区块高度")
 	serveFlagSet.DefineInt("scan-batch", "", 100, "GraphQL 扫描批次大小")
 	serveFlagSet.DefineInt("scan-delay", "", 2000, "GraphQL 扫描查询延迟（毫秒）")
+	serveFlagSet.DefineBool("debug", "d", false, "启用 debug 日志")
 
 	RootCommand.AddCommand(&Command{
 		Name:    "serve",
@@ -340,8 +341,15 @@ func RegisterCommands() {
 			minHeight := serveFlagSet.GetInt("min-height")
 			scanBatch := serveFlagSet.GetInt("scan-batch")
 			scanDelayMs := serveFlagSet.GetInt("scan-delay")
+			debug := serveFlagSet.GetBool("debug")
 
 			if verbose {
+				config.ConfigFile.LogLevel = "debug"
+				config.InitLog()
+			}
+
+			// --debug 覆写日志级别
+			if debug {
 				config.ConfigFile.LogLevel = "debug"
 				config.InitLog()
 			}
@@ -385,6 +393,7 @@ func RegisterCommands() {
 				BitswapEnabled:         true,
 				ScanBatchSize:          scanBatch,
 				ScanQueryDelay:         time.Duration(scanDelayMs) * time.Millisecond,
+				Debug:                  debug || verbose,
 			}
 			if gateway != "" {
 				svcCfg.GatewayURLs = []string{gateway}

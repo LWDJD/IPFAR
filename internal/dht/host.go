@@ -15,7 +15,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
@@ -83,6 +86,10 @@ type HostConfig struct {
 
 	// BootstrapPeers 引导节点地址列表（multiaddr 字符串）
 	BootstrapPeers []string
+
+	// KeyPath 节点私钥持久化路径（PEM 格式 Ed25519 私钥）
+	// 为空时生成临时密钥（不持久化），默认 "node.key"
+	KeyPath string `json:"key_path"`
 }
 
 // DefaultHostConfig 返回默认 host 配置
@@ -107,6 +114,7 @@ func DefaultHostConfig() HostConfig {
 		ConnMgrLow:         100,
 		ConnMgrHigh:        400,
 		ConnMgrGrace:       20 * time.Second,
+		KeyPath:            "node.key",
 	}
 }
 
@@ -125,7 +133,7 @@ func NewHost(cfg HostConfig) (host.Host, error) {
 	}
 
 	// 1. 生成或解析密钥对
-	privKey, err := generateOrParseKey(cfg.PrivateKey)
+	privKey, err := generateOrParseKey(cfg.PrivateKey, cfg.KeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("生成密钥对失败: %w", err)
 	}
@@ -267,8 +275,12 @@ func NewProviderWithHost(hostCfg HostConfig, providerCfg Config) (*Provider, hos
 	return provider, h, nil
 }
 
-// generateOrParseKey 生成 Ed25519 密钥对，或解析已有私钥
-func generateOrParseKey(pemKey string) (crypto.PrivKey, error) {
+// generateOrParseKey 生成 Ed25519 密钥对，或从 PEM 字符串/文件中加载已有私钥。
+//
+// 优先级：pemKey > keyPath 文件 > 生成新密钥
+// 如果 keyPath 不为空且文件存在，从 PEM 文件加载；不存在则生成并持久化到 keyPath。
+func generateOrParseKey(pemKey string, keyPath string) (crypto.PrivKey, error) {
+	// 1. 优先使用 PEM 字符串
 	if pemKey != "" {
 		privKey, err := crypto.UnmarshalPrivateKey([]byte(pemKey))
 		if err != nil {
@@ -277,7 +289,82 @@ func generateOrParseKey(pemKey string) (crypto.PrivKey, error) {
 		return privKey, nil
 	}
 
-	// 生成 Ed25519 密钥对
+	// 2. 从文件加载或生成持久化密钥
+	if keyPath != "" {
+		return loadOrGenerateKeyFile(keyPath)
+	}
+
+	// 3. 生成临时密钥（不持久化）
+	return generateEd25519Key()
+}
+
+// loadOrGenerateKeyFile 从 PEM 文件加载 Ed25519 私钥，不存在则生成并写入文件
+func loadOrGenerateKeyFile(keyPath string) (crypto.PrivKey, error) {
+	data, err := os.ReadFile(keyPath)
+	if err == nil {
+		// 文件存在，解析 PEM
+		block, _ := pem.Decode(data)
+		if block == nil {
+			return nil, fmt.Errorf("解析密钥文件 %s 失败: 无效的 PEM 格式", keyPath)
+		}
+
+		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("解析 PKCS8 私钥失败 %s: %w", keyPath, err)
+		}
+
+		edKey, ok := parsed.(ed25519.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("密钥文件 %s 不是 Ed25519 私钥", keyPath)
+		}
+
+		privKey, err := crypto.UnmarshalEd25519PrivateKey(edKey)
+		if err != nil {
+			return nil, fmt.Errorf("转换 Ed25519 私钥失败: %w", err)
+		}
+
+		log.Info("DHT Host: 已从文件加载节点私钥 path=%s", keyPath)
+		return privKey, nil
+	}
+
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("读取密钥文件 %s 失败: %w", keyPath, err)
+	}
+
+	// 文件不存在，生成新密钥并持久化
+	_, rawPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("生成 Ed25519 密钥对失败: %w", err)
+	}
+
+	// 使用 PKCS#8 + PEM 格式持久化
+	derBytes, err := x509.MarshalPKCS8PrivateKey(rawPriv)
+	if err != nil {
+		return nil, fmt.Errorf("序列化 PKCS8 私钥失败: %w", err)
+	}
+
+	pemBlock := &pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: derBytes,
+	}
+	pemData := pem.EncodeToMemory(pemBlock)
+
+	if err := os.WriteFile(keyPath, pemData, 0600); err != nil {
+		return nil, fmt.Errorf("写入密钥文件 %s 失败: %w", keyPath, err)
+	}
+
+	log.Info("DHT Host: 已生成并持久化节点私钥到 path=%s", keyPath)
+
+	privKey, err := crypto.UnmarshalEd25519PrivateKey(rawPriv)
+	if err != nil {
+		return nil, fmt.Errorf("转换 Ed25519 私钥失败: %w", err)
+	}
+
+	return privKey, nil
+}
+
+// generateEd25519Key 生成临时 Ed25519 密钥（不持久化）
+func generateEd25519Key() (crypto.PrivKey, error) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("生成 Ed25519 密钥对失败: %w", err)
