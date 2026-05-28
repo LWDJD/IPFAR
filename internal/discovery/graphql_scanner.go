@@ -19,6 +19,7 @@ import (
 	"time"
 
 	sdkArweave "github.com/LWDJD/ipfar-sdk/arweave"
+	sdkBundle "github.com/LWDJD/ipfar-sdk/bundle"
 
 	"github.com/lwdjd/IPFAR/internal/index"
 	"github.com/lwdjd/IPFAR/internal/log"
@@ -297,15 +298,16 @@ func (s *GraphQLScanner) queryRange(fromHeight, toHeight uint64) ([]BlockScanRes
 	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
 	defer cancel()
 
-	// 构建 GraphQL 查询：匹配 IPFAR 标签
+	// 构建 GraphQL 查询：匹配 IPFAR 协议标签
+	// 注意：不过滤 IPFAR-Type，因为 Bundle 模式的 DataItem 标签在 L2 层，
+	// Arweave GraphQL API 不索引 Bundle DataItem 的标签。
+	// 返回的交易由 processMetadata 通过 ClassifyByData 进一步分类处理。
 	protocolB64 := base64.RawURLEncoding.EncodeToString([]byte("IPFS-Arweave-Bridge"))
-	ipfarTypeB64 := base64.RawURLEncoding.EncodeToString([]byte("meta"))
 
 	q := sdkArweave.NewGraphQLQuery().
 		AddTagFilter("Protocol", "IPFS-Arweave-Bridge", protocolB64).
-		AddTagFilter("IPFAR-Type", "meta", ipfarTypeB64).
 		SetBlockRange(int(fromHeight), int(toHeight)).
-		SetFirst(500). // 同一范围内可能有很多交易
+		SetFirst(500). // 同一范围内可能有多种交易（直接元数据、Bundle、CAR）
 		SetSort("HEIGHT_ASC")
 
 	txIDs, err := s.client.RunGraphQL(ctx, q)
@@ -326,35 +328,57 @@ func (s *GraphQLScanner) queryRange(fromHeight, toHeight uint64) ([]BlockScanRes
 		MetadataTXIDs: txIDs,
 	}
 
-	log.Debug("GraphQL 扫描器：范围 [%d, %d] 发现 %d 个 IPFAR 元数据交易",
+	log.Debug("GraphQL 扫描器：范围 [%d, %d] 发现 %d 个 IPFAR 协议交易",
 		fromHeight, toHeight, len(txIDs))
 
 	return []BlockScanResult{result}, nil
 }
 
-// processMetadata 处理发现的元数据交易
-// 1. 下载元数据 JSON
-// 2. 轻量验证
-// 3. 索引 CID 和元数据到 Store
-func (s *GraphQLScanner) processMetadata(metaTxID string, blockHeight uint64) error {
+// processMetadata 处理发现的交易（可能是直接元数据或 Bundle）
+//
+// 流程：
+//  1. 下载交易数据
+//  2. 通过 ClassifyByData 判断类型
+//  3. 直接元数据 → processDirectMeta
+//  4. Bundle → processBundle（解析内部 DataItem，查找 IPFAR-Type: meta）
+//  5. 其他类型 → 跳过
+func (s *GraphQLScanner) processMetadata(txID string, blockHeight uint64) error {
 	if s.index == nil {
 		return fmt.Errorf("索引存储未设置")
 	}
 
+	// 下载交易数据
+	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
+	defer cancel()
+
+	data, err := s.client.DownloadTransactionData(ctx, txID)
+	if err != nil {
+		return fmt.Errorf("下载交易数据失败: %w", err)
+	}
+
+	// 根据数据内容分类
+	txType := ClassifyByData(data)
+
+	switch txType {
+	case "meta":
+		return s.processDirectMeta(txID, data, blockHeight)
+	case "bundle":
+		return s.processBundle(txID, data, blockHeight)
+	default:
+		log.Debug("GraphQL 扫描器：跳过非 IPFAR 元数据/Bundle 交易 %s (类型: %s)", txID, txType)
+		return nil
+	}
+}
+
+// processDirectMeta 处理直接元数据交易
+//
+// 1. 轻量验证
+// 2. 索引 CID 和元数据到 Store
+func (s *GraphQLScanner) processDirectMeta(metaTxID string, data []byte, blockHeight uint64) error {
 	// 检查是否已处理过
 	if has, _ := s.index.HasCID(metaTxID); has {
 		log.Debug("GraphQL 扫描器：元数据已处理，跳过 %s", metaTxID)
 		return nil
-	}
-
-	// 下载元数据交易内容
-	ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
-	defer cancel()
-
-	// 通过 SDK 客户端下载交易数据
-	data, err := s.client.DownloadTransactionData(ctx, metaTxID)
-	if err != nil {
-		return fmt.Errorf("下载元数据交易失败: %w", err)
 	}
 
 	// 轻量验证
@@ -422,6 +446,50 @@ func (s *GraphQLScanner) processMetadata(metaTxID string, blockHeight uint64) er
 	// 回调 Service 触发后续下载、完整验证、DHT 发布
 	if s.onMetaFound != nil {
 		s.onMetaFound(metaTxID, data, blockHeight)
+	}
+
+	return nil
+}
+
+// processBundle 处理 ANS-104 Bundle 交易
+//
+// 下载并解析 Bundle，遍历内部 DataItem，查找携带 IPFAR-Type: meta 标签的
+// 元数据 DataItem，对其进行验证和索引。
+// DataItem 的 ID（base64url 编码）作为虚拟 txID 用于索引。
+func (s *GraphQLScanner) processBundle(bundleTxID string, bundleData []byte, blockHeight uint64) error {
+	bundle, err := sdkBundle.ParseBundle(bundleData)
+	if err != nil {
+		return fmt.Errorf("解析 Bundle 失败: %w", err)
+	}
+
+	log.Debug("GraphQL 扫描器：Bundle %s 包含 %d 个 DataItem", bundleTxID, len(bundle.Items))
+
+	metaCount := 0
+	for _, item := range bundle.Items {
+		// 检查 DataItem 是否有 IPFAR-Type: meta 标签
+		if !HasMetaTag(item.Tags) {
+			continue
+		}
+
+		// 计算 DataItem ID（base64url 编码）
+		itemID := base64.RawURLEncoding.EncodeToString(item.Id)
+
+		log.Debug("GraphQL 扫描器：发现 Bundle 内元数据 DataItem itemID=%s bundle=%s",
+			itemID, bundleTxID)
+
+		// 处理该 DataItem 中的元数据
+		if err := s.processDirectMeta(itemID, item.Data, blockHeight); err != nil {
+			log.Warn("GraphQL 扫描器：处理 Bundle 内元数据失败 itemID=%s bundle=%s: %v",
+				itemID, bundleTxID, err)
+			continue
+		}
+		metaCount++
+	}
+
+	if metaCount > 0 {
+		log.Info("GraphQL 扫描器：Bundle %s 中处理了 %d 条元数据", bundleTxID, metaCount)
+	} else {
+		log.Debug("GraphQL 扫描器：Bundle %s 中未找到 IPFAR-Type: meta 的 DataItem", bundleTxID)
 	}
 
 	return nil

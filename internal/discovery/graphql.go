@@ -71,24 +71,25 @@ func NewGraphQLBlockCheckerWithClient(client *sdkArweave.GatewayClient, timeout 
 
 // CheckBlock 实现 BlockChecker 接口
 //
-// 通过 GraphQL 查询指定区块高度中标记为 IPFAR 协议的元数据交易。
-// 查询标签：Protocol = "IPFS-Arweave-Bridge" AND IPFAR-Type = "meta"
+// 通过 GraphQL 查询指定区块高度中标记为 IPFAR 协议的交易。
+// 查询标签：Protocol = "IPFS-Arweave-Bridge"
+// 注意：不再过滤 IPFAR-Type，因为 Bundle 模式的 DataItem 标签在 L2 层，
+// Arweave GraphQL API 不索引 Bundle DataItem 的标签。
+// 返回的交易需由调用方通过 ClassifyByData/ClassifyByTags 进一步分类。
 // 使用 block height filter 限定到指定区块。
 func (c *GraphQLBlockChecker) CheckBlock(height uint64) (found bool, metadataTXIDs []string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	// 构建 GraphQL 查询
-	// 匹配标签：Protocol = "IPFS-Arweave-Bridge" 且 IPFAR-Type = "meta"
+	// 匹配标签：Protocol = "IPFS-Arweave-Bridge"
 	// 同时也在 Base64URL 编码形式中匹配（兼容 goar chunked-upload tags）
 	protocolB64 := base64.RawURLEncoding.EncodeToString([]byte("IPFS-Arweave-Bridge"))
-	ipfarTypeB64 := base64.RawURLEncoding.EncodeToString([]byte("meta"))
 
 	q := sdkArweave.NewGraphQLQuery().
 		AddTagFilter("Protocol", "IPFS-Arweave-Bridge", protocolB64).
-		AddTagFilter("IPFAR-Type", "meta", ipfarTypeB64).
 		SetBlockRange(int(height), int(height)).
-		SetFirst(100). // 同一区块中可能有多个 IPFAR 元数据交易
+		SetFirst(100). // 同一区块中可能有多个 IPFAR 交易（含直接元数据和 Bundle）
 		SetSort("HEIGHT_ASC")
 
 	txIDs, err := c.client.RunGraphQL(ctx, q)
@@ -100,7 +101,7 @@ func (c *GraphQLBlockChecker) CheckBlock(height uint64) (found bool, metadataTXI
 		return false, nil, nil
 	}
 
-	log.Debug("GraphQL 发现：区块 %d 包含 %d 个 IPFAR 元数据交易", height, len(txIDs))
+	log.Debug("GraphQL 发现：区块 %d 包含 %d 个 IPFAR 协议交易", height, len(txIDs))
 	return true, txIDs, nil
 }
 
