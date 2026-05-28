@@ -253,7 +253,7 @@ func (s *GraphQLScanner) scanBatch() {
 		batchEnd = maxH
 	}
 
-	log.Debug("GraphQL 扫描器：扫描批次 [%d, %d]", current, batchEnd)
+	log.Debug("GraphQL 查询：范围 [%d, %d] batchSize=%d", current, batchEnd, s.batchSize)
 
 	// 通过 GraphQL 查询该范围内的 IPFAR 交易
 	foundBlocks, err := s.queryRange(current, batchEnd)
@@ -288,6 +288,7 @@ func (s *GraphQLScanner) scanBatch() {
 	s.saveLastScannedHeight(batchEnd)
 
 	if totalFound > 0 {
+		log.Debug("GraphQL 结果：%d 个区块含 %d 条元数据", len(foundBlocks), totalFound)
 		log.Info("GraphQL 扫描器：批次 [%d, %d] 完成，发现 %d 个区块含 %d 条元数据",
 			current, batchEnd, len(foundBlocks), totalFound)
 	}
@@ -328,8 +329,8 @@ func (s *GraphQLScanner) queryRange(fromHeight, toHeight uint64) ([]BlockScanRes
 		MetadataTXIDs: txIDs,
 	}
 
-	log.Debug("GraphQL 扫描器：范围 [%d, %d] 发现 %d 个 IPFAR 协议交易",
-		fromHeight, toHeight, len(txIDs))
+	log.Debug("GraphQL 结果：%d 条 IPFAR 协议交易（范围 [%d, %d]）",
+		len(txIDs), fromHeight, toHeight)
 
 	return []BlockScanResult{result}, nil
 }
@@ -358,6 +359,7 @@ func (s *GraphQLScanner) processMetadata(txID string, blockHeight uint64) error 
 
 	// 根据数据内容分类
 	txType := ClassifyByData(data)
+	log.Debug("交易分类：txID=%s type=%s", txID, txType)
 
 	switch txType {
 	case "meta":
@@ -462,7 +464,7 @@ func (s *GraphQLScanner) processBundle(bundleTxID string, bundleData []byte, blo
 		return fmt.Errorf("解析 Bundle 失败: %w", err)
 	}
 
-	log.Debug("GraphQL 扫描器：Bundle %s 包含 %d 个 DataItem", bundleTxID, len(bundle.Items))
+	log.Debug("Bundle 遍历：%d 个 DataItem（bundle=%s）", len(bundle.Items), bundleTxID)
 
 	metaCount := 0
 	for _, item := range bundle.Items {

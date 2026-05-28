@@ -158,6 +158,7 @@ func (w *BlockWatcher) pollLoop() {
 // pollOnce 执行一次轮询
 func (w *BlockWatcher) pollOnce() {
 	currentHeight := w.updateLatestHeight()
+	log.Debug("区块监听器：轮询最新高度 当前=%d", currentHeight)
 	last := atomic.LoadUint64(&w.lastChecked)
 
 	if currentHeight <= last {
@@ -165,7 +166,7 @@ func (w *BlockWatcher) pollOnce() {
 	}
 
 	newBlocks := currentHeight - last
-	log.Debug("区块监听器：发现 %d 个新区块（%d → %d）", newBlocks, last+1, currentHeight)
+	log.Debug("区块监听器：发现新区块 height=%d（+%d 个新区块，%d → %d）", currentHeight, newBlocks, last+1, currentHeight)
 
 	// 检查新区块中是否包含 IPFAR 数据
 	fromHeight := last + 1
@@ -184,6 +185,7 @@ func (w *BlockWatcher) pollOnce() {
 
 	if len(foundIDs) > 0 {
 		w.blocksFound++
+		log.Debug("区块监听器：新块含 %d 个 IPFAR 交易 height=%d", len(foundIDs), currentHeight)
 		log.Info("区块监听器：新区块 %d 包含 %d 个 IPFAR 元数据交易", currentHeight, len(foundIDs))
 
 		if w.onBlockFound != nil {

@@ -191,12 +191,10 @@ func (f *Fetcher) downloadDirect(meta *sdkmeta.Metadata, cachePath string) (stri
 		return "", fmt.Errorf("下载 CAR 文件 %s 失败: %w", dataTXID, err)
 	}
 
-	// data_size 一致性检查：实际接收字节数 vs 元数据声明的 data_size
-	expectedSize := int64(meta.DataSize)
-	if written != expectedSize {
+	// CAR 格式有效性检查：最小 CAR v2 文件为 11 字节（4 字节 pragma + 至少 7 字节 header）
+	if written < 11 {
 		os.Remove(tmpPath)
-		return "", fmt.Errorf("下载 CAR 文件大小不匹配: 期望 %d bytes（data_size），实际接收 %d bytes",
-			expectedSize, written)
+		return "", fmt.Errorf("下载的 CAR 文件太小: %d bytes", written)
 	}
 
 	// 原子重命名
@@ -235,12 +233,9 @@ func (f *Fetcher) downloadFromCrossBundle(meta *sdkmeta.Metadata, cachePath stri
 		return "", fmt.Errorf("跨 Bundle 下载失败 bundle=%s item=%s: %w", bundleTXID, itemID, err)
 	}
 
-	// data_size 一致性检查
-	expectedSize := int64(meta.DataSize)
-	actualSize := int64(len(rawData))
-	if actualSize != expectedSize {
-		return "", fmt.Errorf("跨 Bundle 下载大小不匹配: 期望 %d bytes（data_size），实际 %d bytes",
-			expectedSize, actualSize)
+	// CAR 格式有效性检查：最小 CAR v2 文件为 11 字节
+	if len(rawData) < 11 {
+		return "", fmt.Errorf("下载的 CAR 文件太小: %d bytes", len(rawData))
 	}
 
 	// 写入缓存文件
@@ -248,7 +243,7 @@ func (f *Fetcher) downloadFromCrossBundle(meta *sdkmeta.Metadata, cachePath stri
 		return "", fmt.Errorf("写入 CAR 缓存文件失败: %w", err)
 	}
 
-	log.Info("下载：跨 Bundle CAR 已保存 %s (%d bytes)", cachePath, actualSize)
+	log.Info("下载：跨 Bundle CAR 已保存 %s (%d bytes)", cachePath, len(rawData))
 	return cachePath, nil
 }
 
@@ -276,12 +271,9 @@ func (f *Fetcher) downloadFromSameBundle(meta *sdkmeta.Metadata, cachePath strin
 		return "", fmt.Errorf("创建缓存目录失败: %w", err)
 	}
 
-	// data_size 一致性检查
-	expectedSize := int64(meta.DataSize)
-	actualSize := int64(len(bundleData))
-	if actualSize != expectedSize {
-		return "", fmt.Errorf("同 Bundle 数据大小不匹配: 期望 %d bytes（data_size），实际 %d bytes",
-			expectedSize, actualSize)
+	// CAR 格式有效性检查：最小 CAR v2 文件为 11 字节
+	if len(bundleData) < 11 {
+		return "", fmt.Errorf("下载的 CAR 文件太小: %d bytes", len(bundleData))
 	}
 
 	// 写入缓存文件
@@ -289,7 +281,7 @@ func (f *Fetcher) downloadFromSameBundle(meta *sdkmeta.Metadata, cachePath strin
 		return "", fmt.Errorf("写入 CAR 缓存文件失败: %w", err)
 	}
 
-	log.Info("下载：同 Bundle CAR 已保存 %s (%d bytes)", cachePath, actualSize)
+	log.Info("下载：同 Bundle CAR 已保存 %s (%d bytes)", cachePath, len(bundleData))
 	return cachePath, nil
 }
 

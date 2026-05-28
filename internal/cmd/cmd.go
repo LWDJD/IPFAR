@@ -1,12 +1,16 @@
 package cmd
 
 import (
+	"crypto/rand"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"sort"
 	"strconv"
 	"time"
+
+	"github.com/libp2p/go-libp2p/core/crypto"
 
 	"github.com/lwdjd/IPFAR/config"
 	"github.com/lwdjd/IPFAR/internal/bridge"
@@ -287,6 +291,28 @@ func RegisterCommands() {
 				fmt.Printf("  日志文件：%s\n", cfg.LogFile)
 			}
 			fmt.Printf("  日志格式：%s\n", cfg.LogFormat)
+
+			// 生成节点私钥
+			keyPath := "node.key"
+			if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+				privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+				if err != nil {
+					return fmt.Errorf("生成节点私钥失败: %w", err)
+				}
+				keyBytes, err := crypto.MarshalPrivateKey(privKey)
+				if err != nil {
+					return fmt.Errorf("序列化节点私钥失败: %w", err)
+				}
+				pemBlock := &pem.Block{Type: "ED25519 PRIVATE KEY", Bytes: keyBytes}
+				pemData := pem.EncodeToMemory(pemBlock)
+				if err := os.WriteFile(keyPath, pemData, 0600); err != nil {
+					return fmt.Errorf("写入节点私钥失败: %w", err)
+				}
+				fmt.Printf("  节点私钥：%s\n", keyPath)
+			} else {
+				fmt.Printf("  节点私钥：%s（已存在）\n", keyPath)
+			}
+
 			return nil
 		},
 	})

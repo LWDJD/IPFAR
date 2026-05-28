@@ -6,6 +6,8 @@
 package discovery
 
 import (
+	"fmt"
+
 	sdkArweave "github.com/LWDJD/ipfar-sdk/arweave"
 	sdkBundle "github.com/LWDJD/ipfar-sdk/bundle"
 )
@@ -76,12 +78,28 @@ func ClassifyByData(data []byte) string {
 		return "meta"
 	}
 
-	// 尝试解析为 ANS-104 Bundle
-	if _, err := sdkBundle.ParseBundle(data); err == nil {
+	// 数据太短，不可能包含有效的 Bundle（至少需要 32 字节头）
+	if len(data) < 32 {
+		return "unknown"
+	}
+
+	// 尝试解析为 ANS-104 Bundle，用 recover 防止损坏数据导致 panic
+	bundle, err := parseBundleSafe(data)
+	if err == nil && bundle != nil && len(bundle.Items) > 0 {
 		return "bundle"
 	}
 
 	return "unknown"
+}
+
+// parseBundleSafe 是对 ParseBundle 的安全封装，将 panic 转换为 error 返回。
+func parseBundleSafe(data []byte) (b *sdkBundle.Bundle, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("ParseBundle panic (not a valid bundle): %v", r)
+		}
+	}()
+	return sdkBundle.ParseBundle(data)
 }
 
 // HasMetaTag 检查 DataItem 的 tags 中是否包含 IPFAR-Type: meta
