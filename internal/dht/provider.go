@@ -18,6 +18,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/multiformats/go-multiaddr"
 
 	"github.com/lwdjd/IPFAR/internal/log"
 )
@@ -184,19 +185,23 @@ func (p *Provider) Start() error {
 		dhtOpts = append(dhtOpts, dht.Mode(dht.ModeServer))
 	}
 
-	// 设置引导节点
+	// 始终添加官方默认引导节点
+	dhtOpts = append(dhtOpts, dht.BootstrapPeers(dht.GetDefaultBootstrapPeerAddrInfos()...))
+
+	// 额外添加用户自定义引导节点
 	if len(p.cfg.BootstrapPeers) > 0 {
-		var peerAddrs []peer.AddrInfo
 		for _, addrStr := range p.cfg.BootstrapPeers {
-			addrInfo, err := peer.AddrInfoFromString(addrStr)
+			addr, err := multiaddr.NewMultiaddr(addrStr)
 			if err != nil {
 				log.Warn("DHT Provider: 无效的引导节点地址 %q: %v", addrStr, err)
 				continue
 			}
-			peerAddrs = append(peerAddrs, *addrInfo)
-		}
-		if len(peerAddrs) > 0 {
-			dhtOpts = append(dhtOpts, dht.BootstrapPeers(peerAddrs...))
+			peerInfo, err := peer.AddrInfoFromP2pAddr(addr)
+			if err != nil {
+				log.Warn("DHT Provider: 无法解析引导节点 %q: %v", addrStr, err)
+				continue
+			}
+			dhtOpts = append(dhtOpts, dht.BootstrapPeers(*peerInfo))
 		}
 	}
 
