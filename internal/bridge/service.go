@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/LWDJD/ipfar-sdk/verify/pow"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/host"
 
 	"github.com/lwdjd/IPFAR/internal/bitswap"
 	"github.com/lwdjd/IPFAR/internal/cache"
@@ -145,6 +147,9 @@ type Service struct {
 	// 新架构：GraphQL 顺序扫描 + 区块监听
 	graphQLScanner *discovery.GraphQLScanner
 	blockWatcher   *discovery.BlockWatcher
+
+	// 共享 libp2p host（Bitswap 和 DHT 共用）
+	sharedHost host.Host
 
 	// DHT 内容发布提供器
 	dhtProvider *dht.Provider
@@ -294,7 +299,16 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	}
 
 	// ============================================================
-	// Bitswap 按需拉取架构初始化
+	// 创建共享 libp2p host（Bitswap 和 DHT 共用）
+	// ============================================================
+	if cfg.BitswapEnabled || cfg.DHTEnabled {
+		if err := svc.initSharedHost(cfg); err != nil {
+			log.Warn("桥接服务：共享 libp2p host 初始化失败（非致命），Bitswap 和 DHT 将以独立模式运行: %v", err)
+		}
+	}
+
+	// ============================================================
+	// Bitswap 按需拉取架构初始化（使用共享 host）
 	// ============================================================
 	if cfg.BitswapEnabled {
 		if err := svc.initBitswap(cfg); err != nil {
@@ -303,7 +317,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	}
 
 	// ============================================================
-	// 初始化 DHT Provider
+	// 初始化 DHT Provider（使用共享 host）
 	// ============================================================
 	if cfg.DHTEnabled {
 		if err := svc.initDHTProvider(); err != nil {
@@ -434,6 +448,46 @@ func (s *Service) getOnlineVerifier() *verify.OnlineVerifier {
 	return s.onlineVerifier
 }
 
+// initSharedHost 创建共享的 libp2p host，供 Bitswap 和 DHT 共同使用
+//
+// host 的生命周期由 Service 管理：在 Stop() 中最后关闭。
+func (s *Service) initSharedHost(cfg ServiceConfig) error {
+	// 如果已有共享 host（例如测试注入），直接返回
+	if s.sharedHost != nil {
+		log.Info("桥接服务：共享 host 已存在，跳过创建")
+		return nil
+	}
+
+	// 构建 host 配置
+	listenAddrs := cfg.DHTListenAddresses
+	if len(listenAddrs) == 0 {
+		// 默认同时监听 TCP 和 QUIC
+		listenAddrs = []string{
+			"/ip4/0.0.0.0/tcp/4001",
+			"/ip4/0.0.0.0/udp/4001/quic-v1",
+		}
+	}
+
+	hostCfg := dht.DefaultHostConfig()
+	hostCfg.ListenAddresses = listenAddrs
+
+	// 传递 DHT 引导节点配置（如果有的话）
+	var bootstrapPeers []string
+	if cfg.DHTBootstrapPeers != nil {
+		bootstrapPeers = cfg.DHTBootstrapPeers
+	}
+	hostCfg.BootstrapPeers = bootstrapPeers
+
+	h, err := dht.NewHost(hostCfg)
+	if err != nil {
+		return fmt.Errorf("创建共享 libp2p host 失败: %w", err)
+	}
+
+	s.sharedHost = h
+	log.Info("桥接服务：共享 libp2p host 已创建 peer_id=%s addrs=%v", h.ID(), listenAddrs)
+	return nil
+}
+
 // initDHTProvider 初始化 DHT 内容发布提供器
 func (s *Service) initDHTProvider() error {
 	cfg := dht.DefaultConfig()
@@ -456,10 +510,25 @@ func (s *Service) initDHTProvider() error {
 		}
 	}
 
-	// 如果配置了监听地址，自动创建 host 和 provider
-	if len(s.config.DHTListenAddresses) > 0 {
+	// 如果已有共享 host，直接基于它创建 Provider
+	if s.sharedHost != nil {
+		provider, err := dht.NewProviderWithExistingHost(s.sharedHost, cfg)
+		if err != nil {
+			return fmt.Errorf("创建 DHT Provider (共享 host) 失败: %w", err)
+		}
+		s.dhtProvider = provider
+		log.Info("桥接服务：DHT Provider 已使用共享 host 创建并启动 peer_id=%s", s.sharedHost.ID())
+		return nil
+	}
+
+	// 回退：独立模式——如果配置了监听地址，自动创建 host 和 provider
+	listenAddrs := s.config.DHTListenAddresses
+	if len(listenAddrs) == 0 {
+		listenAddrs = []string{"/ip4/0.0.0.0/tcp/4002"}
+	}
+	if len(listenAddrs) > 0 {
 		hostCfg := dht.DefaultHostConfig()
-		hostCfg.ListenAddresses = s.config.DHTListenAddresses
+		hostCfg.ListenAddresses = listenAddrs
 		if len(cfg.BootstrapPeers) > 0 {
 			hostCfg.BootstrapPeers = cfg.BootstrapPeers
 		}
@@ -531,44 +600,54 @@ func (s *Service) initBitswap(cfg ServiceConfig) error {
 		return fmt.Errorf("创建 BlockFetcher 失败: %w", err)
 	}
 
-	// 5. 创建 Bitswap 服务
-	bitswapPort := cfg.BitswapPort
-	if bitswapPort <= 0 {
-		bitswapPort = 4001
-	}
+	// 5. 创建 Bitswap 服务（共享 host 模式优先，回退到独立 TCP 模式）
+	bitswapCfg := bitswap.DefaultConfig()
+	bitswapCfg.DelayedReply = true
+	bitswapCfg.Cache = blockCache
+	bitswapCfg.Timeout = 30 * time.Second
 
-	maxPortAttempts := 5
-	var lastErr error
-	for attempt := 0; attempt < maxPortAttempts; attempt++ {
-		listenAddr := fmt.Sprintf(":%d", bitswapPort+attempt)
-
-		bitswapCfg := bitswap.DefaultConfig()
-		bitswapCfg.ListenAddr = listenAddr
-		bitswapCfg.DelayedReply = true
-		bitswapCfg.Cache = blockCache
-		bitswapCfg.Timeout = 30 * time.Second
-
-		s.bitswapService, err = bitswap.New(bitswapCfg)
-		if err == nil {
-			if attempt > 0 {
-				log.Warn("桥接服务：Bitswap 端口 %d 被占用，已自动切换至 %d",
-					cfg.BitswapPort, bitswapPort+attempt)
-			}
-			break
+	if s.sharedHost != nil {
+		// 共享 host 模式：Bitswap 注册为 stream handler，不独立监听 TCP
+		s.bitswapService, err = bitswap.NewWithHost(s.sharedHost, bitswapCfg)
+		if err != nil {
+			return fmt.Errorf("Bitswap 共享 host 模式初始化失败: %w", err)
 		}
-		lastErr = err
-	}
+		log.Info("桥接服务：Bitswap 已使用共享 host 注册 stream handler")
+	} else {
+		// 回退：独立 TCP 模式（端口自动探测）
+		bitswapPort := cfg.BitswapPort
+		if bitswapPort <= 0 {
+			bitswapPort = 4001
+		}
 
-	if s.bitswapService == nil {
-		return fmt.Errorf("Bitswap 无法绑定端口（尝试了 %d 个端口）: %w",
-			maxPortAttempts, lastErr)
+		maxPortAttempts := 5
+		var lastErr error
+		for attempt := 0; attempt < maxPortAttempts; attempt++ {
+			listenAddr := fmt.Sprintf(":%d", bitswapPort+attempt)
+			bitswapCfg.ListenAddr = listenAddr
+
+			s.bitswapService, err = bitswap.New(bitswapCfg)
+			if err == nil {
+				if attempt > 0 {
+					log.Warn("桥接服务：Bitswap 端口 %d 被占用，已自动切换至 %d",
+						cfg.BitswapPort, bitswapPort+attempt)
+				}
+				break
+			}
+			lastErr = err
+		}
+
+		if s.bitswapService == nil {
+			return fmt.Errorf("Bitswap 无法绑定端口（尝试了 %d 个端口）: %w",
+				maxPortAttempts, lastErr)
+		}
 	}
 
 	// 6. 注册 BlockFetcher 到 Bitswap
 	s.bitswapService.SetBlockFetcher(s.blockFetcher)
 
-	log.Info("桥接服务：Bitswap 按需拉取架构已初始化 port=%d cache_size=%dMB",
-		bitswapPort, cacheSize>>20)
+	log.Info("桥接服务：Bitswap 按需拉取架构已初始化 cache_size=%dMB",
+		cacheSize>>20)
 	return nil
 }
 
@@ -582,6 +661,94 @@ func (s *Service) GetDHTProvider() *dht.Provider {
 	return s.dhtProvider
 }
 
+// restoreDHTCIDs 从持久化索引恢复已验证的 CID 到 DHT Provider
+//
+// 桥接服务重启后，DHT Provider 的 cidRegistry 是空的，re-provide 循环只能
+// re-provide 已注册的 CID。此方法扫描持久化索引中所有已验证的交易，提取 RootCID，
+// 调用 dhtProvider.Provide() 注册到内存中。之后 re-provide 循环会按配置的间隔
+// 自动重新发布。
+func (s *Service) restoreDHTCIDs() {
+	if s.dhtProvider == nil || !s.dhtProvider.IsStarted() {
+		log.Debug("桥接服务：跳过 DHT CID 恢复，Provider 未启动")
+		return
+	}
+	if s.indexStore == nil {
+		log.Debug("桥接服务：跳过 DHT CID 恢复，索引存储未初始化")
+		return
+	}
+
+	// 1. 获取所有已索引的 metaTxID
+	metaIDs, err := s.indexStore.GetAllMetaIDs()
+	if err != nil {
+		log.Warn("桥接服务：获取所有 metaID 失败: %v", err)
+		return
+	}
+
+	count := 0
+	for _, metaTxID := range metaIDs {
+		// 跳过内部使用的 key（如 __scanner_progress__）
+		if strings.HasPrefix(metaTxID, "__") {
+			continue
+		}
+
+		// 2. 检查是否已验证通过
+		verified, err := s.indexStore.IsVerified(metaTxID)
+		if err != nil || !verified {
+			continue
+		}
+
+		// 3. 获取 meta 参数，提取 rootCid
+		params, err := s.indexStore.GetMeta(metaTxID)
+		if err != nil || params == nil {
+			continue
+		}
+
+		rootCidStr, ok := params["rootCid"]
+		if !ok || rootCidStr == "" {
+			continue
+		}
+
+		// 4. 检查 DHT 发布时间戳，如果 21h 内发布过则跳过
+		lastPubTime, err := s.indexStore.GetDHTTimestamp(rootCidStr)
+		if err == nil && lastPubTime > 0 {
+			elapsed := time.Since(time.Unix(lastPubTime, 0))
+			if elapsed < 21*time.Hour {
+				log.Debug("DHT 恢复：跳过 %s（%v 前刚发布过）", rootCidStr, elapsed)
+				count++ // 仍计入已恢复
+				continue
+			}
+		}
+
+		// 5. 解析 CID 并 Provide
+		rootCID, err := cid.Decode(rootCidStr)
+		if err != nil {
+			log.Warn("桥接服务：无法解析 rootCid %q: %v", rootCidStr, err)
+			continue
+		}
+
+		if err := s.dhtProvider.Provide(rootCID); err != nil {
+			log.Warn("桥接服务：DHT 恢复 Provide 失败 %s: %v", rootCidStr, err)
+		} else {
+			log.Info("桥接服务：DHT 已恢复发布 %s (metaTxID=%s)", rootCidStr, metaTxID)
+			// 记录发布时间
+			_ = s.indexStore.MarkDHTPublished(rootCidStr)
+			count++
+		}
+	}
+
+	log.Info("桥接服务：DHT CID 恢复完成，共处理 %d 个已验证交易", count)
+}
+
+// SetSharedHost 注入外部共享 libp2p host（用于测试或外部管理 host 生命周期）
+func (s *Service) SetSharedHost(h host.Host) {
+	s.sharedHost = h
+}
+
+// GetSharedHost 获取共享 libp2p host
+func (s *Service) GetSharedHost() host.Host {
+	return s.sharedHost
+}
+
 // Start 启动桥接服务
 func (s *Service) Start() error {
 	log.Info("桥接服务：启动中...")
@@ -591,8 +758,11 @@ func (s *Service) Start() error {
 	log.Info("  在线验证: %v", s.config.OnlineVerify)
 	log.Info("  下载并发: %d | 在线验证并发: %d",
 		cap(s.downloadSema), cap(s.onlineSema))
+	if s.sharedHost != nil {
+		log.Info("  共享 Host: peer_id=%s addrs=%v", s.sharedHost.ID(), s.sharedHost.Addrs())
+	}
 	if s.bitswapService != nil {
-		log.Info("  Bitswap: 已启用 (端口 %d)", s.config.BitswapPort)
+		log.Info("  Bitswap: 已启用 (%s)", s.bitswapService.ListenAddr())
 	} else {
 		log.Info("  Bitswap: 未启用")
 	}
@@ -653,6 +823,11 @@ func (s *Service) Start() error {
 	}
 
 	// ============================================================
+	// 从持久化索引恢复已验证的 CID 到 DHT Provider
+	// ============================================================
+	s.restoreDHTCIDs()
+
+	// ============================================================
 	// 旧模式兼容：启动采样器
 	// ============================================================
 	if s.sampler != nil {
@@ -702,6 +877,13 @@ func (s *Service) Stop() {
 		s.blockWatcher.Stop()
 	}
 
+	// 停止 DHT Provider
+	if s.dhtProvider != nil {
+		if err := s.dhtProvider.Stop(); err != nil {
+			log.Warn("桥接服务：停止 DHT Provider 失败: %v", err)
+		}
+	}
+
 	// 停止 Bitswap 服务
 	if s.bitswapService != nil {
 		if err := s.bitswapService.Close(); err != nil {
@@ -709,11 +891,12 @@ func (s *Service) Stop() {
 		}
 	}
 
-	// 停止 DHT Provider
-	if s.dhtProvider != nil {
-		if err := s.dhtProvider.Stop(); err != nil {
-			log.Warn("桥接服务：停止 DHT Provider 失败: %v", err)
+	// 关闭共享 libp2p host（在 DHT 和 Bitswap 都停止后）
+	if s.sharedHost != nil {
+		if err := s.sharedHost.Close(); err != nil {
+			log.Warn("桥接服务：关闭共享 host 失败: %v", err)
 		}
+		log.Info("桥接服务：共享 libp2p host 已关闭")
 	}
 
 	// 关闭 Badger 数据库
@@ -1125,7 +1308,7 @@ func (s *Service) dhtProvideCID(rootCIDStr string) {
 // 在索引完成后调用，确保 DHT 网络能发现这些 CID
 func (s *Service) dhtProvideMetaCIDs(meta *sdkmeta.Metadata) {
 	if s.dhtProvider == nil || !s.dhtProvider.IsStarted() {
-		log.Warn("桥接服务：DHT Provider 未启动，跳过 CID 发布")
+		log.Debug("DHT 发布：跳过，DHT Provider 未启动")
 		return
 	}
 
@@ -1140,6 +1323,12 @@ func (s *Service) dhtProvideMetaCIDs(meta *sdkmeta.Metadata) {
 			cidStrs = append(cidStrs, entry.CIDs...)
 		}
 	}
+
+	refCount := len(cidStrs)
+	if meta.RootCID != "" {
+		refCount = len(cidStrs) - 1 // 排除 RootCID 自身
+	}
+	log.Debug("DHT 发布：开始发布元数据 CID root_cid=%s 引用数=%d", meta.RootCID, refCount)
 
 	for _, cidStr := range cidStrs {
 		cidStr := cidStr
@@ -1156,6 +1345,8 @@ func (s *Service) dhtProvideMetaCIDs(meta *sdkmeta.Metadata) {
 			}
 		}()
 	}
+
+	log.Debug("DHT 发布：RootCID=%s 已提交发布", meta.RootCID)
 }
 
 // processFullDownload 路径 B：完整下载 CAR 文件
