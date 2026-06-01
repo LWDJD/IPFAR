@@ -53,6 +53,9 @@ type Config struct {
 	RetryMaxDelay time.Duration
 	// MaxCachedCIDs 最多缓存的 CID 数量（用于 re-provide）
 	MaxCachedCIDs int
+	// AdvertiseInterval 节点广告间隔（定期向 DHT 网络公布连接信息）
+	// 0 表示禁用广告循环
+	AdvertiseInterval time.Duration
 }
 
 // DefaultConfig 返回默认配置
@@ -67,6 +70,7 @@ func DefaultConfig() Config {
 		RetryBaseDelay:     30 * time.Second,
 		RetryMaxDelay:      5 * time.Minute,
 		MaxCachedCIDs:      10000,
+		AdvertiseInterval:  30 * time.Minute,
 	}
 }
 
@@ -143,6 +147,8 @@ func NewProvider(host host.Host, cfg Config) (*Provider, error) {
 	if cfg.MaxCachedCIDs <= 0 {
 		cfg.MaxCachedCIDs = 10000
 	}
+	// AdvertiseInterval 不在此设置默认值：0 表示禁用广告循环，
+	// 默认值由 DefaultConfig() 提供（30 分钟）。
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -159,6 +165,22 @@ func NewProvider(host host.Host, cfg Config) (*Provider, error) {
 	log.Debug("DHT Provider：创建成功 mode=%s bootstrap_peers=%d", cfg.Mode, len(cfg.BootstrapPeers))
 
 	return p, nil
+}
+
+// NewProviderWithExistingHost 使用已有 libp2p host 创建并启动 DHT Provider
+//
+// 与 NewProviderWithHost 不同，此函数不创建 host，而是接受外部传入的共享 host。
+// 适用于 Bitswap 和 DHT 共享同一 host 的桥接架构。
+// 内部调用 NewProvider + Start，一步完成创建和启动。
+func NewProviderWithExistingHost(host host.Host, cfg Config) (*Provider, error) {
+	provider, err := NewProvider(host, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := provider.Start(); err != nil {
+		return nil, fmt.Errorf("启动 Provider 失败: %w", err)
+	}
+	return provider, nil
 }
 
 // Start 启动 DHT Provider
@@ -190,6 +212,25 @@ func (p *Provider) Start() error {
 	// 始终添加官方默认引导节点
 	dhtOpts = append(dhtOpts, dht.BootstrapPeers(dht.GetDefaultBootstrapPeerAddrInfos()...))
 
+	// 额外添加纯 IP 的公共引导节点，弥补默认 dnsaddr 节点在 DNS 受限环境下的不足
+	additionalBootstrapPeers := []string{
+		"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+		"/ip4/147.75.83.83/tcp/4001/p2p/QmVaU6kR4iQ27FGgoL9KFN2HQPZbMsYcGjpgxrGFBCHjCu",
+		"/ip4/147.75.109.213/tcp/4001/p2p/12D3KooWHJtuW81BingU7kwJ2pLkm2DyXBQYBbkDvw2dkzGGSUPi",
+	}
+	for _, addrStr := range additionalBootstrapPeers {
+		addr, err := multiaddr.NewMultiaddr(addrStr)
+		if err != nil {
+			continue
+		}
+		peerInfo, err := peer.AddrInfoFromP2pAddr(addr)
+		if err != nil {
+			continue
+		}
+		dhtOpts = append(dhtOpts, dht.BootstrapPeers(*peerInfo))
+		log.Debug("DHT Provider: 添加额外引导节点 %s", peerInfo.ID)
+	}
+
 	// 额外添加用户自定义引导节点
 	if len(p.cfg.BootstrapPeers) > 0 {
 		for _, addrStr := range p.cfg.BootstrapPeers {
@@ -214,9 +255,11 @@ func (p *Provider) Start() error {
 	}
 	p.dht = d
 
-	// 启动 DHT bootstrap
+	// 启动 DHT bootstrap（带超时保护，防止网络不通时无限阻塞）
 	log.Debug("DHT Provider：开始连接引导节点...")
-	if err := p.dht.Bootstrap(p.ctx); err != nil {
+	bootstrapCtx, bootstrapCancel := context.WithTimeout(p.ctx, 60*time.Second)
+	defer bootstrapCancel()
+	if err := p.dht.Bootstrap(bootstrapCtx); err != nil {
 		log.Warn("DHT Provider: Bootstrap 失败（非致命）: %v", err)
 	}
 	log.Debug("DHT Provider：引导节点连接完成")
@@ -230,6 +273,9 @@ func (p *Provider) Start() error {
 	// 启动重试循环
 	p.wg.Add(1)
 	go p.retryLoop()
+
+	// 启动节点广告循环
+	p.startAdvertiseLoop()
 
 	log.Info("DHT Provider: 已启动 peer_id=%s", p.host.ID())
 	return nil
@@ -479,6 +525,127 @@ func (p *Provider) reprovideAll() {
 	p.stats.ActiveCIDs = len(p.cidRegistry)
 	p.stats.LastProvideTime = time.Now()
 	p.stats.mu.Unlock()
+}
+
+// startAdvertiseLoop 定期向 DHT 网络公布节点连接信息
+//
+// 桥节点需要让 DHT 网络中其他节点知道自己的多地址，否则其他节点
+// 只知道 peer ID 但连接时报 "no addresses"。
+//
+// 工作原理：ForceRefresh 触发 doRefresh，其中 queryForSelf 执行
+// 对自身 peer ID 的 FIND_NODE 查询。周围节点处理查询时通过 libp2p
+// Identify 协议获取我们的地址并更新它们的路由表，达到公布效果。
+//
+// 启动后立即执行首次公告（延迟 15s 等待 Bootstrap 完成），之后按
+// AdvertiseInterval 定期执行。设为 0 可禁用。
+func (p *Provider) startAdvertiseLoop() {
+	if p.cfg.AdvertiseInterval <= 0 {
+		log.Info("DHT Provider: 节点广告循环已禁用（AdvertiseInterval=0）")
+		return
+	}
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+
+		log.Info("DHT Provider: 节点广告循环已启动 interval=%s peer_id=%s",
+			p.cfg.AdvertiseInterval, p.host.ID())
+
+		// 首次公告：延迟 15 秒等待 Bootstrap 完成，然后立即公告一次
+		select {
+		case <-time.After(15 * time.Second):
+			p.doAdvertise()
+		case <-p.ctx.Done():
+			return
+		}
+
+		// 后续定期公告
+		ticker := time.NewTicker(p.cfg.AdvertiseInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				p.doAdvertise()
+			case <-p.ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// doAdvertise 执行一次节点连接信息公告
+//
+// 通过 ForceRefresh 刷新所有路由桶，同时触发 queryForSelf 让周围节点
+// 获取并缓存我们的地址信息。带 30 秒超时保护。
+// 超时后回退到 Bootstrap 重连引导节点，确保节点在 DHT 网络中保持可达。
+func (p *Provider) doAdvertise() {
+	if p.dht == nil {
+		log.Warn("DHT Provider: 跳过节点公告，DHT 实例为空")
+		return
+	}
+
+	addrs := p.host.Addrs()
+	pid := p.host.ID()
+
+	// 统计传输类型
+	transports := make(map[string]int)
+	for _, a := range addrs {
+		multiaddr.ForEach(a, func(c multiaddr.Component) bool {
+			transports[c.Protocol().Name]++
+			return true
+		})
+	}
+
+	log.Info("DHT Provider: 开始向 DHT 网络公布节点连接信息 peer_id=%s addrs=%d transports=%v",
+		pid, len(addrs), transports)
+
+	// ForceRefresh 强制刷新所有路由桶，调用链：
+	//   ForceRefresh → doRefresh(true) → queryForSelf + refreshCpl(每个桶)
+	//   queryForSelf 执行 FIND_NODE(self)，周边节点通过此过程
+	//   更新对我们地址的记录
+	errCh := p.dht.ForceRefresh()
+
+	// 等待刷新完成，带超时保护和优雅关闭响应
+	select {
+	case err := <-errCh:
+		if err != nil {
+			log.Warn("DHT Provider: 路由表刷新失败 peer_id=%s: %v", pid, err)
+			p.stats.mu.Lock()
+			p.stats.LastError = fmt.Errorf("节点公告刷新失败: %w", err)
+			p.stats.mu.Unlock()
+
+			// 刷新失败时尝试重新 Bootstrap 作为补救
+			log.Info("DHT Provider: 路由刷新失败，尝试 Bootstrap 重连...")
+			bctx, bcancel := context.WithTimeout(p.ctx, 30*time.Second)
+			defer bcancel()
+			if berr := p.dht.Bootstrap(bctx); berr != nil {
+				log.Warn("DHT Provider: Bootstrap 补救也失败: %v", berr)
+			} else {
+				log.Info("DHT Provider: Bootstrap 补救成功")
+			}
+		} else {
+			log.Info("DHT Provider: 节点连接信息已成功公布 peer_id=%s addrs=%d transports=%v",
+				pid, len(addrs), transports)
+		}
+	case <-time.After(30 * time.Second):
+		log.Warn("DHT Provider: 路由表刷新超时（30s），尝试 Bootstrap 补救 peer_id=%s", pid)
+		p.stats.mu.Lock()
+		p.stats.LastError = fmt.Errorf("节点公告刷新超时")
+		p.stats.mu.Unlock()
+
+		// 超时时也尝试 Bootstrap 作为补救
+		bctx, bcancel := context.WithTimeout(p.ctx, 30*time.Second)
+		defer bcancel()
+		if berr := p.dht.Bootstrap(bctx); berr != nil {
+			log.Warn("DHT Provider: Bootstrap 补救也失败: %v", berr)
+		} else {
+			log.Info("DHT Provider: Bootstrap 补救成功")
+		}
+	case <-p.ctx.Done():
+		log.Debug("DHT Provider: 节点公告被取消（ctx 已关闭）")
+		return
+	}
 }
 
 // retryLoop 重试循环

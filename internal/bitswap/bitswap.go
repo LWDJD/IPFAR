@@ -4,7 +4,7 @@
 // 在 1.6G 内存约束下保持精简。
 //
 // 功能：
-//   - Bitswap 客户端/服务端 TCP 直连
+//   - Bitswap 客户端/服务端（支持裸 TCP 和 libp2p host 两种模式）
 //   - 延迟回复机制：降低本桥节点在 IPFS 网络中的回源优先级
 //   - 请求到的 block 自动写入本地缓存
 //   - WantList 管理 + Block 收发
@@ -25,6 +25,11 @@ import (
 	"time"
 
 	cid "github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-varint"
 
 	"github.com/lwdjd/IPFAR/internal/cache"
@@ -42,6 +47,19 @@ type BlockFetcher interface {
 }
 
 // ============================================================
+// 内部抽象：连接接口
+// ============================================================
+
+// connLike 抽象 net.Conn 和 network.Stream，使核心协议逻辑对传输层透明。
+type connLike interface {
+	io.Reader
+	io.Writer
+	io.Closer
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+}
+
+// ============================================================
 // 常量
 // ============================================================
 
@@ -50,10 +68,10 @@ const (
 	protocolID = "/ipfs/bitswap/1.2.0"
 
 	// 消息类型
-	msgWantList  = 0
-	msgBlock     = 1
-	msgHave      = 2
-	msgDontHave  = 3
+	msgWantList = 0
+	msgBlock    = 1
+	msgHave     = 2
+	msgDontHave = 3
 
 	// 默认配置
 	defaultTimeout       = 30 * time.Second
@@ -67,7 +85,8 @@ const (
 
 // Config Bitswap 服务配置
 type Config struct {
-	// ListenAddr TCP 监听地址，为空则不启动服务端
+	// ListenAddr TCP 监听地址，为空则不启动服务端。
+	// 在共享 host 模式（NewWithHost）下此字段被忽略。
 	ListenAddr string
 	// DelayedReply 是否启用延迟回复（推荐开启）
 	DelayedReply bool
@@ -106,10 +125,17 @@ type Service struct {
 	mu     sync.RWMutex
 	cache  *cache.Cache
 
-	listener   net.Listener
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	// TCP 模式字段
+	listener net.Listener
+
+	// libp2p 共享 host 模式字段
+	host      host.Host
+	streamCtx context.Context
+	streamWG  sync.WaitGroup
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	// Peer 连接管理
 	peers   map[string]*peerConn
@@ -133,14 +159,18 @@ type Service struct {
 
 // peerConn 代表一个 peer 连接
 type peerConn struct {
-	conn      net.Conn
-	addr      string
+	conn      connLike
+	addr      string // TCP 地址 或 peer.ID 字符串
 	writeMu   sync.Mutex
 	closeOnce sync.Once
 	closed    chan struct{}
 }
 
-// New 创建 Bitswap 服务
+// ============================================================
+// 构造函数
+// ============================================================
+
+// New 创建 Bitswap 服务（裸 TCP 模式，独立监听端口）
 func New(config Config) (*Service, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -183,18 +213,72 @@ func New(config Config) (*Service, error) {
 		s.wg.Add(1)
 		go s.acceptLoop()
 
-		log.Info("Bitswap：监听 %s", ln.Addr().String())
+		log.Info("Bitswap：监听 %s（裸 TCP 模式）", ln.Addr().String())
 	}
 
-	log.Info("Bitswap：服务已初始化 delayed=%v delay=%v",
+	log.Info("Bitswap：服务已初始化 delayed=%v delay=%v mode=tcp",
 		config.DelayedReply, config.DelayDuration)
 	return s, nil
 }
+
+// NewWithHost 创建 Bitswap 服务（共享 libp2p host 模式）
+//
+// Bitswap 会在 host 上注册 stream handler（协议 /ipfs/bitswap/1.2.0），
+// 不再自己监听 TCP 端口。出站连接通过 host.NewStream 发起。
+// host 的生命周期由调用者管理，Close() 不会关闭 host。
+func NewWithHost(host host.Host, config Config) (*Service, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	if config.Timeout <= 0 {
+		config.Timeout = defaultTimeout
+	}
+	if config.MaxMsgSize <= 0 {
+		config.MaxMsgSize = defaultMaxMsgSize
+	}
+
+	s := &Service{
+		config:   config,
+		host:     host,
+		ctx:      ctx,
+		cancel:   cancel,
+		peers:    make(map[string]*peerConn),
+		wantList: make(map[string]int32),
+	}
+
+	// 初始化缓存
+	if config.Cache != nil {
+		s.cache = config.Cache
+	} else {
+		var err error
+		s.cache, err = cache.New(config.CacheConfig)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("bitswap: 创建缓存失败: %w", err)
+		}
+	}
+
+	// 在 host 上注册 stream handler（libp2p 自动处理 multistream-select 协商）
+	host.SetStreamHandler(protocol.ID(protocolID), s.handleStream)
+
+	log.Info("Bitswap：服务已初始化 delayed=%v delay=%v mode=shared-host peer_id=%s",
+		config.DelayedReply, config.DelayDuration, host.ID())
+	return s, nil
+}
+
+// ============================================================
+// 生命周期
+// ============================================================
 
 // Close 关闭服务
 func (s *Service) Close() error {
 	s.cancel()
 
+	// libp2p 模式：取消 stream handler 注册
+	if s.host != nil {
+		s.host.RemoveStreamHandler(protocol.ID(protocolID))
+	}
+
+	// TCP 模式：关闭监听器
 	if s.listener != nil {
 		s.listener.Close()
 	}
@@ -207,6 +291,7 @@ func (s *Service) Close() error {
 	s.peersMu.Unlock()
 
 	s.wg.Wait()
+	s.streamWG.Wait()
 
 	if s.cache != nil {
 		s.cache.Close()
@@ -221,6 +306,10 @@ func (s *Service) Close() error {
 // ============================================================
 
 // GetBlock 向指定 peer 请求一个 block
+//
+// 在 TCP 模式下，peerAddr 为 "host:port" 格式。
+// 在共享 host 模式下，peerAddr 为包含 peer ID 的 multiaddr 字符串
+// （如 "/ip4/1.2.3.4/tcp/4001/p2p/12D3KooW..."）。
 func (s *Service) GetBlock(ctx context.Context, peerAddr string, c cid.Cid) ([]byte, error) {
 	atomic.AddUint64(&s.blocksRequested, 1)
 
@@ -233,6 +322,48 @@ func (s *Service) GetBlock(ctx context.Context, peerAddr string, c cid.Cid) ([]b
 	pc, err := s.connect(peerAddr)
 	if err != nil {
 		return nil, fmt.Errorf("bitswap: connect to %s: %w", peerAddr, err)
+	}
+
+	// 发送 WantList
+	if err := s.sendWantList(pc, []cid.Cid{c}); err != nil {
+		return nil, fmt.Errorf("bitswap: send wantlist: %w", err)
+	}
+
+	// 等待响应
+	deadline := time.Now().Add(s.config.Timeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	pc.conn.SetReadDeadline(deadline)
+
+	data, err := s.readBlockResponse(pc, c)
+	if err != nil {
+		return nil, fmt.Errorf("bitswap: read response: %w", err)
+	}
+
+	// 缓存
+	s.cache.Put(c.String(), data)
+	atomic.AddUint64(&s.blocksCached, 1)
+
+	return data, nil
+}
+
+// FetchBlock 通过 libp2p host 向指定 peer 请求一个 block
+//
+// 这是共享 host 模式下的原生出站方法。内部使用 host.NewStream 创建连接，
+// libp2p 自动处理 multistream-select 协议协商。
+func (s *Service) FetchBlock(ctx context.Context, peerID peer.ID, c cid.Cid) ([]byte, error) {
+	atomic.AddUint64(&s.blocksRequested, 1)
+
+	// 先查缓存
+	if data, found, _ := s.cache.Get(c.String()); found {
+		return data, nil
+	}
+
+	// 通过 libp2p 建立 stream
+	pc, err := s.connectPeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("bitswap: connect to peer %s: %w", peerID, err)
 	}
 
 	// 发送 WantList
@@ -274,7 +405,19 @@ func (s *Service) ListenAddr() string {
 	if s.listener != nil {
 		return s.listener.Addr().String()
 	}
+	if s.host != nil {
+		addrs := s.host.Addrs()
+		if len(addrs) > 0 {
+			return addrs[0].String() + "/p2p/" + s.host.ID().String()
+		}
+		return s.host.ID().String()
+	}
 	return ""
+}
+
+// Host 返回共享的 libp2p host（仅在 NewWithHost 模式下非 nil）
+func (s *Service) Host() host.Host {
+	return s.host
 }
 
 // Stats 返回统计信息
@@ -306,9 +449,10 @@ func (s *Service) GetBlockFetcher() BlockFetcher {
 }
 
 // ============================================================
-// 连接管理
+// 连接管理 (TCP 模式)
 // ============================================================
 
+// connect 建立到指定地址的连接（TCP 模式使用 net.Dial；共享 host 模式解析 multiaddr）
 func (s *Service) connect(addr string) (*peerConn, error) {
 	s.peersMu.Lock()
 	if pc, ok := s.peers[addr]; ok {
@@ -323,6 +467,12 @@ func (s *Service) connect(addr string) (*peerConn, error) {
 	}
 	s.peersMu.Unlock()
 
+	// 共享 host 模式：解析 multiaddr 后通过 host.NewStream 连接
+	if s.host != nil {
+		return s.connectViaMultiaddr(addr)
+	}
+
+	// TCP 模式：裸 TCP 连接
 	conn, err := net.DialTimeout("tcp", addr, s.config.Timeout)
 	if err != nil {
 		return nil, err
@@ -347,6 +497,60 @@ func (s *Service) connect(addr string) (*peerConn, error) {
 	return pc, nil
 }
 
+// connectViaMultiaddr 解析 multiaddr 地址并使用共享 host 建立 libp2p stream
+func (s *Service) connectViaMultiaddr(addr string) (*peerConn, error) {
+	maddr, err := multiaddr.NewMultiaddr(addr)
+	if err != nil {
+		return nil, fmt.Errorf("无效的 multiaddr %q: %w", addr, err)
+	}
+
+	info, err := peer.AddrInfoFromP2pAddr(maddr)
+	if err != nil {
+		return nil, fmt.Errorf("无法从 multiaddr 提取 peer 信息 %q: %w", addr, err)
+	}
+
+	return s.connectPeer(context.Background(), info.ID)
+}
+
+// connectPeer 通过共享 host 建立到指定 peer 的 libp2p stream
+func (s *Service) connectPeer(ctx context.Context, peerID peer.ID) (*peerConn, error) {
+	if s.host == nil {
+		return nil, fmt.Errorf("bitswap: host 为 nil，无法建立 libp2p 连接（请使用 NewWithHost 初始化）")
+	}
+
+	pidStr := peerID.String()
+
+	s.peersMu.Lock()
+	if pc, ok := s.peers[pidStr]; ok {
+		select {
+		case <-pc.closed:
+			delete(s.peers, pidStr)
+		default:
+			s.peersMu.Unlock()
+			return pc, nil
+		}
+	}
+	s.peersMu.Unlock()
+
+	stream, err := s.host.NewStream(ctx, peerID, protocol.ID(protocolID))
+	if err != nil {
+		return nil, fmt.Errorf("创建 stream 到 peer %s: %w", peerID, err)
+	}
+
+	pc := &peerConn{
+		conn:   stream,
+		addr:   pidStr,
+		closed: make(chan struct{}),
+	}
+
+	s.peersMu.Lock()
+	s.peers[pidStr] = pc
+	s.peersMu.Unlock()
+
+	log.Debug("Bitswap：已连接到 peer %s", peerID)
+	return pc, nil
+}
+
 func (pc *peerConn) close() {
 	pc.closeOnce.Do(func() {
 		close(pc.closed)
@@ -365,7 +569,7 @@ func (pc *peerConn) write(data []byte) error {
 // 协议实现
 // ============================================================
 
-// handshake 发送多流协议握手
+// handshake 发送多流协议握手（仅 TCP 模式使用；libp2p 模式由 multistream-select 自动协商）
 func (s *Service) handshake(conn net.Conn) error {
 	// Multistream select: 发送协议 ID
 	// 格式: varint(协议ID长度) + 协议ID字节 + "\n"
@@ -483,7 +687,7 @@ func (s *Service) readBlockResponse(pc *peerConn, expected cid.Cid) ([]byte, err
 }
 
 // ============================================================
-// 服务端 (accept loop)
+// 服务端 - TCP 模式 (accept loop)
 // ============================================================
 
 func (s *Service) acceptLoop() {
@@ -532,6 +736,29 @@ func (s *Service) handleConn(conn net.Conn) {
 	conn.Write(buf[:n])
 
 	// 处理请求
+	s.processMessages(conn)
+}
+
+// ============================================================
+// 服务端 - libp2p 共享 host 模式 (stream handler)
+// ============================================================
+
+// handleStream 处理来自 libp2p host 的入站 stream
+//
+// libp2p 已通过 multistream-select 完成协议协商，stream 就绪后直接处理 Bitswap 消息。
+func (s *Service) handleStream(stream network.Stream) {
+	s.streamWG.Add(1)
+	defer s.streamWG.Done()
+	defer stream.Close()
+
+	log.Debug("Bitswap：收到来自 peer %s 的 stream", stream.Conn().RemotePeer())
+
+	// libp2p 已协商协议，直接处理消息
+	s.processMessages(stream)
+}
+
+// processMessages 处理连接上的 Bitswap 消息（TCP 和 libp2p 共用）
+func (s *Service) processMessages(conn connLike) {
 	for {
 		msgType, err := s.readVarint(conn)
 		if err != nil {
@@ -548,7 +775,7 @@ func (s *Service) handleConn(conn net.Conn) {
 	}
 }
 
-func (s *Service) handleWantList(conn net.Conn) {
+func (s *Service) handleWantList(conn connLike) {
 	// 读取 WantList
 	count, err := s.readVarint(conn)
 	if err != nil {
@@ -638,7 +865,7 @@ func (s *Service) handleWantList(conn net.Conn) {
 	}
 }
 
-func (s *Service) sendBlock(conn net.Conn, c cid.Cid, data []byte) error {
+func (s *Service) sendBlock(w io.Writer, c cid.Cid, data []byte) error {
 	var buf bytes.Buffer
 	buf.WriteByte(msgBlock)
 
@@ -648,11 +875,11 @@ func (s *Service) sendBlock(conn net.Conn, c cid.Cid, data []byte) error {
 	buf.Write(varint.ToUvarint(uint64(len(data))))
 	buf.Write(data)
 
-	_, err := conn.Write(buf.Bytes())
+	_, err := w.Write(buf.Bytes())
 	return err
 }
 
-func (s *Service) sendDontHave(conn net.Conn, c cid.Cid) error {
+func (s *Service) sendDontHave(w io.Writer, c cid.Cid) error {
 	var buf bytes.Buffer
 	buf.WriteByte(msgDontHave)
 
@@ -660,7 +887,7 @@ func (s *Service) sendDontHave(conn net.Conn, c cid.Cid) error {
 	buf.Write(varint.ToUvarint(uint64(len(cidBytes))))
 	buf.Write(cidBytes)
 
-	_, err := conn.Write(buf.Bytes())
+	_, err := w.Write(buf.Bytes())
 	return err
 }
 
@@ -697,9 +924,9 @@ func (s *Service) readVarint(r io.Reader) (uint64, error) {
 
 // Stats Bitswap 统计信息
 type Stats struct {
-	ListenAddr      string          `json:"listen_addr"`
-	BlocksRequested uint64          `json:"blocks_requested"`
-	BlocksServed    uint64          `json:"blocks_served"`
-	BlocksCached    uint64          `json:"blocks_cached"`
+	ListenAddr      string           `json:"listen_addr"`
+	BlocksRequested uint64           `json:"blocks_requested"`
+	BlocksServed    uint64           `json:"blocks_served"`
+	BlocksCached    uint64           `json:"blocks_cached"`
 	CacheStats      cache.CacheStats `json:"cache_stats"`
 }

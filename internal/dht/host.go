@@ -27,6 +27,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
@@ -41,6 +42,33 @@ import (
 	"github.com/lwdjd/IPFAR/internal/log"
 	"github.com/lwdjd/IPFAR/internal/version"
 )
+
+// defaultRelays 公共 IPFS 中继节点，供 AutoRelay PeerSource 回退使用。
+//
+// 这些是中继服务提供方，当节点检测到自己位于 NAT 后时，
+// AutoRelay 会尝试通过这些中继建立 circuit v2 连接。
+//
+// 地址全部使用纯 IPv4，确保在 DNS 受限环境中也能正常工作。
+// 同时保留 dnsaddr 地址以便在 DNS 可用时利用负载均衡和 TLS SNI 等特性。
+var defaultRelays = []peer.AddrInfo{
+	{
+		// relay.ws.ipfs.icu (已知公共中继)
+		ID: peer.ID("12D3KooWQtpSRMFK1NwpF4EwKBHvnCw3JzxfXtTkJpYBtNgejCJ5"),
+		Addrs: []multiaddr.Multiaddr{
+			multiaddr.StringCast("/ip4/139.178.65.47/tcp/4001"),
+			multiaddr.StringCast("/ip4/139.178.65.47/udp/4001/quic-v1"),
+			multiaddr.StringCast("/dnsaddr/relay.ws.ipfs.icu"),
+		},
+	},
+}
+
+// additionalBootstrapPeers 额外的纯 IPv4 引导节点，弥补默认 dnsaddr 引导节点
+// 在某些网络环境下 DNS 解析失败的缺陷，确保节点始终能接入 IPFS 公共网络。
+var additionalBootstrapPeers = []string{
+	"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+	"/ip4/147.75.83.83/tcp/4001/p2p/QmVaU6kR4iQ27FGgoL9KFN2HQPZbMsYcGjpgxrGFBCHjCu",
+	"/ip4/147.75.109.213/tcp/4001/p2p/12D3KooWHJtuW81BingU7kwJ2pLkm2DyXBQYBbkDvw2dkzGGSUPi",
+}
 
 // HostConfig libp2p host 配置
 type HostConfig struct {
@@ -159,6 +187,8 @@ func NewHost(cfg HostConfig) (host.Host, error) {
 	}
 
 	// 4. 构建 libp2p 选项
+	var h host.Host // 提前声明，供 AutoRelay PeerSource 闭包捕获
+
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrs(listenAddrs...),
@@ -188,9 +218,91 @@ func NewHost(cfg HostConfig) (host.Host, error) {
 		)
 	}
 
-	// AutoRelay — 自动发现中继服务器
+	// AutoRelay — 自动发现中继服务器，在 NAT 后通告中继地址
+	//
+	// 使用动态 PeerSource 方式发现中继节点：
+	//   1. 优先从已连接的 peer 中寻找候选中继（通过 DHT 引导节点自然发现的公网节点）
+	//   2. 回退到静态配置的纯 IP 中继节点列表
+	//
+	// 这种方式比纯静态中继更灵活，且不依赖 DNS 解析。
+	// go-libp2p v0.48+ 通过 EnableAutoRelayWithPeerSource 支持。
 	if cfg.EnableAutoRelay {
-		opts = append(opts, libp2p.EnableAutoRelay())
+		// hRef 捕获 &h；h 在 libp2p.New 之后被赋值。
+		// 闭包通过 *hRef 访问 host，初始为 nil，AutoRelay 首次调用 PeerSource
+		// 时如果 host 尚未就绪则只使用静态回退列表。
+		hRef := &h
+
+		peerSource := func(ctx context.Context, num int) <-chan peer.AddrInfo {
+			ch := make(chan peer.AddrInfo, num)
+			go func() {
+				defer close(ch)
+				sent := 0
+				// 第一优先级：从已连接的公网 peer 中寻找候选中继
+				if host := *hRef; host != nil {
+					connectedPeers := host.Network().Peers()
+					for _, p := range connectedPeers {
+						if sent >= num {
+							return
+						}
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
+						// 跳过没有已知地址的 peer
+						addrs := host.Peerstore().Addrs(p)
+						if len(addrs) == 0 {
+							continue
+						}
+						// 过滤掉私有地址和环回地址 — 中继必须是公网可达的
+						var publicAddrs []multiaddr.Multiaddr
+						for _, a := range addrs {
+							addrStr := a.String()
+							if !containsAnyPrefix(addrStr,
+								"/ip4/127.", "/ip4/192.168.", "/ip4/10.",
+								"/ip4/172.16.", "/ip4/172.17.", "/ip4/172.18.",
+								"/ip4/172.19.", "/ip4/172.20.", "/ip4/172.21.",
+								"/ip4/172.22.", "/ip4/172.23.", "/ip4/172.24.",
+								"/ip4/172.25.", "/ip4/172.26.", "/ip4/172.27.",
+								"/ip4/172.28.", "/ip4/172.29.", "/ip4/172.30.",
+								"/ip4/172.31.",
+							) {
+								publicAddrs = append(publicAddrs, a)
+							}
+						}
+						if len(publicAddrs) == 0 {
+							continue
+						}
+						select {
+						case ch <- peer.AddrInfo{ID: p, Addrs: publicAddrs}:
+							sent++
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+				// 第二优先级：回退到静态配置的纯 IP 中继节点
+				for _, relay := range defaultRelays {
+					if sent >= num {
+						return
+					}
+					select {
+					case ch <- relay:
+						sent++
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+			return ch
+		}
+
+		opts = append(opts, libp2p.EnableAutoRelayWithPeerSource(peerSource,
+			autorelay.WithNumRelays(2),
+			autorelay.WithBootDelay(1*time.Minute),
+			autorelay.WithBackoff(30*time.Minute),
+		))
+		log.Info("DHT Host: AutoRelay 已启用 (动态 PeerSource + 静态回退)")
 	}
 
 	// Hole Punching — NAT 打洞
@@ -219,7 +331,7 @@ func NewHost(cfg HostConfig) (host.Host, error) {
 	}
 
 	// 5. 创建 host
-	h, err := libp2p.New(opts...)
+	h, err = libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("创建 libp2p host 失败: %w", err)
 	}
@@ -235,16 +347,16 @@ func NewHost(cfg HostConfig) (host.Host, error) {
 		log.Info("DHT Host: mDNS 局域网发现已启动")
 	}
 
-	// 7. 连接到引导节点
-	if len(cfg.BootstrapPeers) > 0 {
-		go connectToBootstrapPeers(h, cfg.BootstrapPeers)
-	}
+	// 7. 连接到引导节点（始终包含额外的纯 IP 引导节点）
+	go connectToBootstrapPeers(h, cfg.BootstrapPeers)
 
-	// 8. 打印监听地址
-	for _, addr := range h.Addrs() {
+	// 8. 打印监听地址（含完整 p2p 地址）
+	addrs := h.Addrs()
+	log.Info("DHT Host: 监听地址共 %d 个:", len(addrs))
+	for _, addr := range addrs {
 		fullAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("%s/p2p/%s", addr, pid))
 		if fullAddr != nil {
-			log.Info("DHT Host: 监听地址 %s", fullAddr)
+			log.Info("DHT Host:   %s", fullAddr)
 		}
 	}
 
@@ -403,9 +515,27 @@ func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 }
 
 // connectToBootstrapPeers 连接到引导节点列表
+//
+// 首先尝试用户提供的引导节点，然后追加纯 IP 的公共引导节点
+// 以提高在 DNS 解析受限网络中的连接成功率。
 func connectToBootstrapPeers(h host.Host, peers []string) {
+	// 合并用户提供的引导节点和额外的纯 IP 引导节点
+	allPeers := make([]string, 0, len(peers)+len(additionalBootstrapPeers))
+	allPeers = append(allPeers, peers...)
+	allPeers = append(allPeers, additionalBootstrapPeers...)
+
+	// 去重（基于地址字符串）
+	seen := make(map[string]bool)
+	var deduped []string
+	for _, p := range allPeers {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			deduped = append(deduped, p)
+		}
+	}
+
 	var connected int
-	for _, addrStr := range peers {
+	for _, addrStr := range deduped {
 		addr, err := multiaddr.NewMultiaddr(addrStr)
 		if err != nil {
 			log.Warn("DHT Host: 无效的引导节点地址 %q: %v", addrStr, err)
@@ -430,5 +560,16 @@ func connectToBootstrapPeers(h host.Host, peers []string) {
 		log.Info("DHT Host: 已连接到引导节点 %s", info.ID)
 	}
 
-	log.Info("DHT Host: 引导完成 connected=%d/%d", connected, len(peers))
+	log.Info("DHT Host: 引导完成 connected=%d/%d", connected, len(deduped))
+}
+
+// containsAnyPrefix 检查字符串 s 是否以 prefixes 中的任一前缀开头。
+// 用于快速过滤私有/环回 IP 地址的 multiaddr 字符串。
+func containsAnyPrefix(s string, prefixes ...string) bool {
+	for _, prefix := range prefixes {
+		if len(s) >= len(prefix) && s[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
 }
