@@ -11,6 +11,17 @@
 //
 // 协议参考: https://github.com/ipfs/specs/blob/main/network-protocols/bitswap.md
 // 规范参考: ipfar-specs/V1/项目规划.md §四.1、§四.2
+//
+// 线协议格式 (v1.2.0):
+//
+//	每条消息 = varint(消息总长度) + protobuf编码的 Message
+//
+// Message 由以下字段组成:
+//   - wantlist (字段1): 请求列表
+//   - blocks (字段2): [已废弃] 原始 block 数据
+//   - payload (字段3): Block 消息列表 (含 CID prefix + data)
+//   - blockPresences (字段4): Have / DontHave 通知
+//   - pendingBytes (字段5): 待发送字节数
 package bitswap
 
 import (
@@ -31,6 +42,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-varint"
+	"google.golang.org/protobuf/proto"
+
+	pb "github.com/ipfs/boxo/bitswap/message/pb"
 
 	"github.com/lwdjd/IPFAR/internal/cache"
 	"github.com/lwdjd/IPFAR/internal/log"
@@ -66,12 +80,6 @@ type connLike interface {
 const (
 	// Bitswap 协议 ID (v1.2.0)
 	protocolID = "/ipfs/bitswap/1.2.0"
-
-	// 消息类型
-	msgWantList = 0
-	msgBlock    = 1
-	msgHave     = 2
-	msgDontHave = 3
 
 	// 默认配置
 	defaultTimeout       = 30 * time.Second
@@ -122,8 +130,8 @@ func DefaultConfig() Config {
 type Service struct {
 	config Config
 
-	mu     sync.RWMutex
-	cache  *cache.Cache
+	mu    sync.RWMutex
+	cache *cache.Cache
 
 	// TCP 模式字段
 	listener net.Listener
@@ -566,7 +574,7 @@ func (pc *peerConn) write(data []byte) error {
 }
 
 // ============================================================
-// 协议实现
+// 协议实现 — 线协议 (长度前缀 + protobuf)
 // ============================================================
 
 // handshake 发送多流协议握手（仅 TCP 模式使用；libp2p 模式由 multistream-select 自动协商）
@@ -599,91 +607,112 @@ func (s *Service) handshake(conn net.Conn) error {
 	return nil
 }
 
-// sendWantList 发送 WantList 消息
+// sendWantList 发送 WantList 消息（使用标准 Bitswap 线协议）
 func (s *Service) sendWantList(pc *peerConn, cids []cid.Cid) error {
-	var buf bytes.Buffer
-
-	// 消息头: varint(类型)
-	buf.WriteByte(msgWantList)
-
-	// WantList payload: varint(count) + for each: varint(cid_len) + cid_bytes + varint(priority)
-	buf.Write(varint.ToUvarint(uint64(len(cids))))
+	entries := make([]*pb.Message_Wantlist_Entry, 0, len(cids))
 	for _, c := range cids {
-		cidBytes := c.Bytes()
-		buf.Write(varint.ToUvarint(uint64(len(cidBytes))))
-		buf.Write(cidBytes)
-		buf.Write(varint.ToUvarint(1)) // priority = 1 (normal)
+		entries = append(entries, &pb.Message_Wantlist_Entry{
+			Block:        c.Bytes(),
+			Priority:     1,
+			Cancel:       false,
+			WantType:     pb.Message_Wantlist_Block,
+			SendDontHave: true, // 告知对方：如果没有该 block 请回复 DONT_HAVE
+		})
 	}
 
-	return pc.write(buf.Bytes())
+	msg := &pb.Message{
+		Wantlist: &pb.Message_Wantlist{
+			Entries: entries,
+			Full:    false,
+		},
+	}
+
+	return s.writeProtobufMessage(pc, msg)
 }
 
-// readBlockResponse 读取 Block 响应
+// readBlockResponse 读取 Block 响应（使用标准 Bitswap 线协议）
 func (s *Service) readBlockResponse(pc *peerConn, expected cid.Cid) ([]byte, error) {
 	for {
-		msgType, err := s.readVarint(pc.conn)
+		msg, err := s.readProtobufMessage(pc.conn)
 		if err != nil {
-			return nil, fmt.Errorf("read msg type: %w", err)
+			return nil, fmt.Errorf("read message: %w", err)
 		}
 
-		switch msgType {
-		case msgBlock:
-			// Block: varint(cid_len) + cid_bytes + varint(data_len) + data
-			cidLen, err := s.readVarint(pc.conn)
+		// 1. 检查 payload (字段3) — Bitswap 1.1.0+ 格式
+		for _, blk := range msg.GetPayload() {
+			recvCID, err := cidFromPrefixAndData(blk.GetPrefix(), blk.GetData())
 			if err != nil {
-				return nil, fmt.Errorf("read cid len: %w", err)
-			}
-			cidBytes := make([]byte, cidLen)
-			if _, err := io.ReadFull(pc.conn, cidBytes); err != nil {
-				return nil, fmt.Errorf("read cid: %w", err)
-			}
-
-			dataLen, err := s.readVarint(pc.conn)
-			if err != nil {
-				return nil, fmt.Errorf("read data len: %w", err)
-			}
-			if dataLen > uint64(s.config.MaxMsgSize) {
-				return nil, fmt.Errorf("block too large: %d bytes", dataLen)
-			}
-
-			data := make([]byte, dataLen)
-			if _, err := io.ReadFull(pc.conn, data); err != nil {
-				return nil, fmt.Errorf("read data: %w", err)
-			}
-
-			recvCID, err := cid.Cast(cidBytes)
-			if err != nil {
-				return nil, fmt.Errorf("invalid received cid: %w", err)
-			}
-
-			if !recvCID.Equals(expected) {
-				log.Debug("Bitswap: received unexpected cid %s (expected %s)", recvCID, expected)
+				log.Debug("Bitswap: 无法从 payload 重建 CID: %v", err)
 				continue
 			}
-
-			return data, nil
-
-		case msgHave:
-			// 对方有该 block，但没发送（可能是中继场景），继续等待
-			_, err := s.readVarint(pc.conn) // cid_len
-			if err != nil {
-				return nil, fmt.Errorf("read have cid_len: %w", err)
+			if recvCID.Equals(expected) {
+				return blk.GetData(), nil
 			}
-			// 跳过 cid
+			log.Debug("Bitswap: received unexpected cid %s (expected %s)", recvCID, expected)
+		}
+
+		// 2. 检查 blocks (字段2) — Bitswap 1.0.0 已废弃格式
+		for _, blockData := range msg.GetBlocks() {
+			// 旧格式中 block 是原始数据（通常是 CIDv0 / sha256 / 256 bytes 以下的小块）
+			// 无法从原始数据直接验证 CID，但可以尝试
+			recvCID, err := cidFromPrefixAndData(nil, blockData)
+			if err != nil {
+				continue
+			}
+			if recvCID.Equals(expected) {
+				return blockData, nil
+			}
+		}
+
+		// 3. 检查 blockPresences (字段4) — Have / DontHave
+		for _, bp := range msg.GetBlockPresences() {
+			c, err := cid.Cast(bp.GetCid())
+			if err != nil {
+				continue
+			}
+			if c.Equals(expected) {
+				switch bp.GetType() {
+				case pb.Message_Have:
+					// 对方有该 block，但没发送（可能是中继场景），继续等待
+					log.Debug("Bitswap: 收到 HAVE for %s，继续等待 block", expected)
+					continue
+				case pb.Message_DontHave:
+					return nil, fmt.Errorf("peer doesn't have block %s", expected)
+				}
+			}
+		}
+
+		// 4. 如果消息没有任何与 expected CID 相关的内容，继续读取下一条
+		// (可能是其他 peer 的 wantlist 更新等)
+		if len(msg.GetPayload()) == 0 && len(msg.GetBlocks()) == 0 && len(msg.GetBlockPresences()) == 0 {
+			log.Debug("Bitswap: 收到空消息，继续等待")
 			continue
-
-		case msgDontHave:
-			// 对方没有该 block
-			_, err := s.readVarint(pc.conn) // cid_len
-			if err != nil {
-				return nil, fmt.Errorf("read donthave cid_len: %w", err)
-			}
-			return nil, fmt.Errorf("peer doesn't have block %s", expected)
-
-		default:
-			return nil, fmt.Errorf("unexpected message type: %d", msgType)
 		}
 	}
+}
+
+// cidFromPrefixAndData 从 CID prefix 和 block data 重建 CID
+func cidFromPrefixAndData(prefixBytes []byte, data []byte) (cid.Cid, error) {
+	if len(prefixBytes) == 0 {
+		// 无 prefix：尝试作为 CIDv0 (sha256-256-protobuf) 处理
+		// 使用 go-cid 的 V0Builder
+		b := cid.V0Builder{}
+		c, err := b.Sum(data)
+		if err != nil {
+			return cid.Undef, fmt.Errorf("cidFromPrefixAndData V0: %w", err)
+		}
+		return c, nil
+	}
+
+	pref, err := cid.PrefixFromBytes(prefixBytes)
+	if err != nil {
+		return cid.Undef, fmt.Errorf("cidFromPrefixAndData prefix: %w", err)
+	}
+	c, err := pref.Sum(data)
+	if err != nil {
+		return cid.Undef, fmt.Errorf("cidFromPrefixAndData sum: %w", err)
+	}
+	return c, nil
 }
 
 // ============================================================
@@ -758,50 +787,43 @@ func (s *Service) handleStream(stream network.Stream) {
 }
 
 // processMessages 处理连接上的 Bitswap 消息（TCP 和 libp2p 共用）
+//
+// 标准 Bitswap 线协议：每条消息 = varint(长度) + protobuf(Message)
 func (s *Service) processMessages(conn connLike) {
 	for {
-		msgType, err := s.readVarint(conn)
+		msg, err := s.readProtobufMessage(conn)
 		if err != nil {
+			if err != io.EOF {
+				log.Debug("Bitswap: 读取消息失败: %v", err)
+			}
 			return
 		}
 
-		switch msgType {
-		case msgWantList:
-			s.handleWantList(conn)
-		default:
-			log.Debug("Bitswap: 未知消息类型: %d", msgType)
-			return
+		// 处理 WantList
+		if msg.Wantlist != nil && len(msg.Wantlist.Entries) > 0 {
+			s.handleWantListEntries(conn, msg.Wantlist.Entries)
 		}
+
+		// 也可处理其他字段（如 blockPresences），但服务端通常只需响应 WantList
 	}
 }
 
-func (s *Service) handleWantList(conn connLike) {
-	// 读取 WantList
-	count, err := s.readVarint(conn)
-	if err != nil {
-		return
-	}
-
+// handleWantListEntries 处理解析后的 WantList 条目
+func (s *Service) handleWantListEntries(conn connLike, entries []*pb.Message_Wantlist_Entry) {
+	// 收集有效的 CID
 	var cids []cid.Cid
-	for i := uint64(0); i < count; i++ {
-		cidLen, err := s.readVarint(conn)
+	for _, e := range entries {
+		// 跳过取消条目
+		if e.GetCancel() {
+			continue
+		}
+		// 跳过空的 block 字段
+		if len(e.GetBlock()) == 0 {
+			continue
+		}
+		c, err := cid.Cast(e.GetBlock())
 		if err != nil {
-			return
-		}
-		if cidLen > 256 {
-			return
-		}
-		cidBytes := make([]byte, cidLen)
-		if _, err := io.ReadFull(conn, cidBytes); err != nil {
-			return
-		}
-		_, err = s.readVarint(conn) // priority, skip
-		if err != nil {
-			return
-		}
-
-		c, err := cid.Cast(cidBytes)
-		if err != nil {
+			log.Debug("Bitswap: 无效 CID: %v", err)
 			continue
 		}
 		cids = append(cids, c)
@@ -810,6 +832,8 @@ func (s *Service) handleWantList(conn connLike) {
 	if len(cids) == 0 {
 		return
 	}
+
+	log.Debug("Bitswap: 收到 WantList，包含 %d 个 CID", len(cids))
 
 	// 延迟回复机制
 	if s.config.DelayedReply && s.config.DelayDuration > 0 {
@@ -865,30 +889,110 @@ func (s *Service) handleWantList(conn connLike) {
 	}
 }
 
+// sendBlock 发送单个 Block（使用标准 Bitswap 线协议）
 func (s *Service) sendBlock(w io.Writer, c cid.Cid, data []byte) error {
+	msg := &pb.Message{
+		Payload: []*pb.Message_Block{
+			{
+				Prefix: c.Prefix().Bytes(),
+				Data:   data,
+			},
+		},
+	}
+	return s.writeProtobufMessageTo(w, msg)
+}
+
+// sendDontHave 发送 DontHave 响应（使用标准 Bitswap 线协议）
+func (s *Service) sendDontHave(w io.Writer, c cid.Cid) error {
+	msg := &pb.Message{
+		BlockPresences: []*pb.Message_BlockPresence{
+			{
+				Cid:  c.Bytes(),
+				Type: pb.Message_DontHave,
+			},
+		},
+	}
+	return s.writeProtobufMessageTo(w, msg)
+}
+
+// ============================================================
+// 线协议读写辅助
+// ============================================================
+
+// writeProtobufMessage 将 protobuf 消息写入 peerConn
+func (s *Service) writeProtobufMessage(pc *peerConn, msg *pb.Message) error {
 	var buf bytes.Buffer
-	buf.WriteByte(msgBlock)
+	if err := s.encodeProtobufMessage(&buf, msg); err != nil {
+		return err
+	}
+	return pc.write(buf.Bytes())
+}
 
-	cidBytes := c.Bytes()
-	buf.Write(varint.ToUvarint(uint64(len(cidBytes))))
-	buf.Write(cidBytes)
-	buf.Write(varint.ToUvarint(uint64(len(data))))
-	buf.Write(data)
-
+// writeProtobufMessageTo 将 protobuf 消息写入 io.Writer
+func (s *Service) writeProtobufMessageTo(w io.Writer, msg *pb.Message) error {
+	var buf bytes.Buffer
+	if err := s.encodeProtobufMessage(&buf, msg); err != nil {
+		return err
+	}
 	_, err := w.Write(buf.Bytes())
 	return err
 }
 
-func (s *Service) sendDontHave(w io.Writer, c cid.Cid) error {
-	var buf bytes.Buffer
-	buf.WriteByte(msgDontHave)
+// encodeProtobufMessage 将 protobuf 消息编码为线格式并写入 buf
+//
+// 线格式: varint(消息长度) + protobuf字节
+func (s *Service) encodeProtobufMessage(buf *bytes.Buffer, msg *pb.Message) error {
+	msgBytes, err := proto.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal protobuf: %w", err)
+	}
 
-	cidBytes := c.Bytes()
-	buf.Write(varint.ToUvarint(uint64(len(cidBytes))))
-	buf.Write(cidBytes)
+	// 检查大小限制
+	if int64(len(msgBytes)) > s.config.MaxMsgSize {
+		return fmt.Errorf("消息过大: %d bytes (max %d)", len(msgBytes), s.config.MaxMsgSize)
+	}
 
-	_, err := w.Write(buf.Bytes())
-	return err
+	// 写入长度前缀 (varint)
+	lenBuf := make([]byte, binary.MaxVarintLen64)
+	n := binary.PutUvarint(lenBuf, uint64(len(msgBytes)))
+	buf.Write(lenBuf[:n])
+
+	// 写入消息体
+	buf.Write(msgBytes)
+	return nil
+}
+
+// readProtobufMessage 从 reader 读取一条 Bitswap 消息
+//
+// 线格式: varint(消息长度) + protobuf字节
+func (s *Service) readProtobufMessage(r io.Reader) (*pb.Message, error) {
+	// 1. 读取长度前缀 (varint)
+	msgLen, err := s.readVarint(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if msgLen == 0 {
+		return &pb.Message{}, nil
+	}
+
+	if msgLen > uint64(s.config.MaxMsgSize) {
+		return nil, fmt.Errorf("消息过大: %d bytes (max %d)", msgLen, s.config.MaxMsgSize)
+	}
+
+	// 2. 读取消息体
+	msgBytes := make([]byte, msgLen)
+	if _, err := io.ReadFull(r, msgBytes); err != nil {
+		return nil, fmt.Errorf("读取消息体失败: %w", err)
+	}
+
+	// 3. 反序列化 protobuf
+	msg := &pb.Message{}
+	if err := proto.Unmarshal(msgBytes, msg); err != nil {
+		return nil, fmt.Errorf("unmarshal protobuf: %w", err)
+	}
+
+	return msg, nil
 }
 
 // ============================================================
